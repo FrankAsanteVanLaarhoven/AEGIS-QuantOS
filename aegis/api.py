@@ -72,7 +72,19 @@ def create_app(db_path=None,token=None):
                     with service.store.tx():
                         s=service.s(); s['running']=False; service.store.put('state',s); service.store.append('runtime.scheduler_error',{'error_type':type(exc).__name__})
         task=asyncio.create_task(clock())
+        stream_stop=asyncio.Event()
+        stream_task=None
+        if settings.data_mode in ('live','delayed') and alpaca_market.credentials() is not None:
+            def _persist_market_event(ev):
+                with service.store.tx():
+                    service.store.append('market.event',ev.model_dump(mode='json'))
+            stream_task=asyncio.create_task(alpaca_market.run_stream(list(service.dataset.symbols),on_event=_persist_market_event,stop_event=stream_stop))
         yield
+        stream_stop.set()
+        if stream_task is not None:
+            stream_task.cancel()
+            try: await stream_task
+            except asyncio.CancelledError: pass
         task.cancel()
         try: await task
         except asyncio.CancelledError: pass
@@ -88,7 +100,7 @@ def create_app(db_path=None,token=None):
     coordinator=ResearchCoordinator(evidence_store,llm_gateway)
     risk_gate=IndependentRiskGate(store=service.store)
     paper_oms=AlpacaPaperOMS(settings,resolver,store=service.store,risk_gate=risk_gate)
-    app.state.service=service; app.state.token=auth_token; app.state.settings=settings; app.state.secrets=resolver; app.state.market_supervisor=supervisor; app.state.evidence_store=evidence_store; app.state.llm_gateway=llm_gateway; app.state.job_manager=job_manager; app.state.paper_oms=paper_oms; app.state.risk_gate=risk_gate
+    app.state.service=service; app.state.token=auth_token; app.state.settings=settings; app.state.secrets=resolver; app.state.market_supervisor=supervisor; app.state.alpaca_market=alpaca_market; app.state.evidence_store=evidence_store; app.state.llm_gateway=llm_gateway; app.state.job_manager=job_manager; app.state.paper_oms=paper_oms; app.state.risk_gate=risk_gate
     app.add_middleware(TrustedHostMiddleware,allowed_hosts=['localhost','127.0.0.1','testserver','[::1]'])
     @app.middleware('http')
     async def boundary(request:Request,call_next):

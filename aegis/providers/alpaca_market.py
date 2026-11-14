@@ -5,23 +5,33 @@ Never substitutes synthetic data on failure or entitlement denial.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 import httpx
 
 from aegis.market.contracts import MarketEvent, payload_sha256
 from aegis.market.supervisor import MarketDataSupervisor
+from aegis.providers.ws_client import AsyncWebSocket, WebSocketClosed
 from aegis.secrets import SecretResolver
 from aegis.settings import AegisSettings
 
 
 class AlpacaMarketAdapter:
-    def __init__(self, settings: AegisSettings, resolver: SecretResolver, supervisor: MarketDataSupervisor) -> None:
+    def __init__(
+        self,
+        settings: AegisSettings,
+        resolver: SecretResolver,
+        supervisor: MarketDataSupervisor,
+        *,
+        stream_url: str | None = None,
+    ) -> None:
         self.settings = settings
         self.resolver = resolver
         self.supervisor = supervisor
+        self._stream_url_override = stream_url
 
     def credentials(self) -> tuple[str, str] | None:
         key = self.resolver.resolve('ALPACA_API_KEY')
@@ -32,7 +42,8 @@ class AlpacaMarketAdapter:
         return key, sec
 
     def stream_endpoint(self) -> str:
-        return f"{self.settings.alpaca_stream_url.rstrip('/')}/{self.settings.alpaca_data_feed}"
+        base = (self._stream_url_override or self.settings.alpaca_stream_url).rstrip('/')
+        return f'{base}/{self.settings.alpaca_data_feed}'
 
     def build_auth_message(self) -> dict[str, str]:
         creds = self.credentials()
@@ -118,21 +129,40 @@ class AlpacaMarketAdapter:
         url = f"{self.settings.alpaca_data_base_url.rstrip('/')}/v2/stocks/bars"
         own_client = client is None
         http = client or httpx.Client(timeout=15.0)
+        pages_bars: list[tuple[str, dict[str, Any]]] = []
+        pages = 0
+        page_token: str | None = None
         try:
-            resp = http.get(url, headers=headers, params=params)
-            if resp.status_code in (401, 403):
-                self.supervisor.mark_blocked_entitlement(f'Alpaca REST backfill {resp.status_code}')
-                return {'status': 'BLOCKED_ENTITLEMENT', 'http_status': resp.status_code, 'bars_ingested': 0}
-            resp.raise_for_status()
-            data = resp.json()
+            while True:
+                req_params = dict(params)
+                if page_token:
+                    req_params['page_token'] = page_token
+                resp = http.get(url, headers=headers, params=req_params)
+                if resp.status_code in (401, 403):
+                    self.supervisor.mark_blocked_entitlement(f'Alpaca REST backfill {resp.status_code}')
+                    return {'status': 'BLOCKED_ENTITLEMENT', 'http_status': resp.status_code, 'bars_ingested': 0}
+                if resp.status_code == 409:
+                    self.supervisor.mark_disconnected('Alpaca REST conflict (409)')
+                    return {'status': 'CONFLICT_409', 'http_status': 409, 'bars_ingested': 0}
+                if resp.status_code == 429:
+                    self.supervisor.mark_disconnected('Alpaca REST rate limited (429)')
+                    return {'status': 'RATE_LIMITED', 'http_status': 429, 'bars_ingested': 0}
+                resp.raise_for_status()
+                data = resp.json()
+                pages += 1
+                for sym, rows in (data.get('bars') or {}).items():
+                    for row in rows:
+                        pages_bars.append((sym, row))
+                page_token = data.get('next_page_token')
+                if not page_token:
+                    break
         finally:
             if own_client:
                 http.close()
 
         rx = datetime.now(timezone.utc)
         count = 0
-        for sym, rows in (data.get('bars') or {}).items():
-            for row in rows:
+        for sym, row in pages_bars:
                 pts = datetime.fromisoformat(str(row['t']).replace('Z', '+00:00'))
                 ev = MarketEvent(
                     event_id=f"alpaca_rest:{self.settings.alpaca_data_feed}:{sym}:{row['t']}",
@@ -157,5 +187,80 @@ class AlpacaMarketAdapter:
                 )
                 self.supervisor.push_event(ev)
                 count += 1
-        return {'status': 'OK', 'bars_ingested': count, 'feed': self.settings.alpaca_data_feed}
+        return {'status': 'OK', 'bars_ingested': count, 'pages': pages, 'feed': self.settings.alpaca_data_feed}
+
+    async def run_stream(
+        self,
+        symbols: list[str],
+        *,
+        on_event: Callable[[MarketEvent], Any] | None = None,
+        stop_event: asyncio.Event | None = None,
+        max_reconnects: int | None = None,
+        heartbeat_seconds: float = 20.0,
+        base_backoff_seconds: float = 0.25,
+    ) -> None:
+        """Maintain a supervised WebSocket stream with auth, subscribe, heartbeat, and reconnect."""
+        creds = self.credentials()
+        if not creds:
+            return
+        attempts = 0
+        while True:
+            if stop_event and stop_event.is_set():
+                return
+            ws: AsyncWebSocket | None = None
+            try:
+                ws = await AsyncWebSocket.connect(self.stream_endpoint(), timeout=10.0)
+                await ws.send_text(json.dumps(self.build_auth_message()))
+                # Read up to 2 frames for connected + auth status
+                authed = False
+                for _ in range(3):
+                    raw = await ws.recv_text(timeout=10.0)
+                    items = json.loads(raw) if raw.strip().startswith('[') else [json.loads(raw)]
+                    for item in items:
+                        if item.get('T') == 'error':
+                            code = int(item.get('code') or 0)
+                            msg = str(item.get('msg') or 'stream error')
+                            if code in (401, 403):
+                                self.supervisor.mark_blocked_entitlement(f'Alpaca WS {code}: {msg}')
+                                await ws.close()
+                                return
+                            if code == 406 or code == 409:
+                                raise ConnectionError(f'Alpaca WS connection limit ({code}): {msg}')
+                            raise ConnectionError(f'Alpaca WS error ({code}): {msg}')
+                        if item.get('T') == 'success' and 'authenticated' in str(item.get('msg', '')).lower():
+                            authed = True
+                    if authed:
+                        break
+                if not authed:
+                    self.supervisor.mark_authenticated()
+                await ws.send_text(json.dumps(self.build_subscribe_message(symbols)))
+
+                while True:
+                    if stop_event and stop_event.is_set():
+                        await ws.close()
+                        return
+                    try:
+                        frame = await ws.recv_text(timeout=heartbeat_seconds)
+                    except asyncio.TimeoutError:
+                        await ws.ping()
+                        continue
+                    events = self.handle_ws_messages(frame)
+                    for ev in events:
+                        if on_event is not None:
+                            res = on_event(ev)
+                            if asyncio.iscoroutine(res):
+                                await res
+            except (ConnectionError, OSError, asyncio.TimeoutError, WebSocketClosed) as exc:
+                self.supervisor.mark_disconnected(str(exc))
+                attempts += 1
+                if max_reconnects is not None and attempts > max_reconnects:
+                    return
+                if stop_event and stop_event.is_set():
+                    return
+                delay = self.supervisor.next_backoff_seconds(base=base_backoff_seconds, cap=30.0)
+                await asyncio.sleep(delay)
+            finally:
+                if ws is not None and not ws.closed:
+                    await ws.close()
+
 
