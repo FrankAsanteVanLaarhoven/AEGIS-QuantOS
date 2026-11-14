@@ -34,8 +34,8 @@ def test_three_arm_evaluation_and_evidence_checker_rejects_hallucinated_citation
     lock.write_text(json.dumps({
         'schema_version': 1,
         'roles': {
-            'market_researcher': {'model_id': 'openai/gpt-test', 'approved_fallbacks': []},
-            'hypothesis_author': {'model_id': 'openai/gpt-test', 'approved_fallbacks': []},
+            'market_researcher': {'model_id': 'openai/gpt-test', 'approved_fallbacks': [], 'pricing': {'prompt': '0.000002', 'completion': '0.000006'}},
+            'hypothesis_author': {'model_id': 'openai/gpt-test', 'approved_fallbacks': [], 'pricing': {'prompt': '0.000002', 'completion': '0.000006'}},
         },
     }), encoding='utf-8')
     settings = AegisSettings.from_env({'AEGIS_ENABLE_PAID_LLM': 'true', 'AEGIS_OPENROUTER_MODELS_LOCK': str(lock)})
@@ -101,3 +101,4 @@ def test_durable_job_manager_step_limit_and_cancel():
     jm.cancel(rec2.job_id)
     assert jm.get(rec2.job_id).status == 'CANCELLED'
     assert set(FINANCE_ROLES.keys()) == {'filing_extractor', 'market_researcher', 'hypothesis_author', 'evidence_checker', 'report_explainer'}
+

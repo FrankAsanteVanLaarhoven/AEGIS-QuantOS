@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import json
+import math
 import threading
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from typing import Any, Literal
 
 import httpx
 from pydantic import BaseModel, ConfigDict
 
+from aegis.brokers.context import AccountSnapshot
 from aegis.risk.policy import IndependentRiskGate, OrderIntent, RiskDecision
 from aegis.secrets import SecretResolver
 from aegis.settings import AegisSettings
@@ -121,21 +124,29 @@ class AlpacaPaperOMS:
                 (rec.account_id, rec.environment, rec.client_order_id, rec.intent_hash, rec.model_dump_json()),
             )
 
-    def _get_record(self, client_order_id: str, account_id: str = 'paper_default', environment: str = 'paper_external') -> OrderOutboxRecord:
-        key = (account_id, environment, client_order_id)
-        if self._store is not None:
-            with self._store.lock:
-                row = self._store.db.execute(
-                    'SELECT record_json FROM paper_oms_outbox WHERE account_id=? AND environment=? AND client_order_id=?',
-                    key,
-                ).fetchone()
-                if row is not None:
-                    rec = OrderOutboxRecord.model_validate_json(row['record_json'])
-                    self._outbox[key] = rec
-                    return rec
-        if key not in self._outbox:
+    def _get_record(self, client_order_id: str, account_id: str | None = None, environment: str = 'paper_external') -> OrderOutboxRecord:
+        if account_id is not None:
+            key = (account_id, environment, client_order_id)
+            if self._store is not None:
+                with self._store.lock:
+                    row = self._store.db.execute(
+                        'SELECT record_json FROM paper_oms_outbox WHERE account_id=? AND environment=? AND client_order_id=?',
+                        key,
+                    ).fetchone()
+                    if row is not None:
+                        rec = OrderOutboxRecord.model_validate_json(row['record_json'])
+                        self._outbox[key] = rec
+                        return rec
+            if key not in self._outbox:
+                raise KeyError(f'Unknown client_order_id: {client_order_id}')
+            return self._outbox[key]
+        self._load_all()
+        matches = [r for (acc, env, cid), r in self._outbox.items() if env == environment and cid == client_order_id]
+        if not matches:
             raise KeyError(f'Unknown client_order_id: {client_order_id}')
-        return self._outbox[key]
+        if len(matches) > 1:
+            raise ValueError(f'Ambiguous client_order_id across accounts: {client_order_id}')
+        return matches[0]
 
     def _release_if_terminal(self, rec: OrderOutboxRecord) -> None:
         if self._risk_gate is not None and rec.state in TERMINAL_STATES:
@@ -159,30 +170,32 @@ class AlpacaPaperOMS:
 
         key = (intent.account_id, intent.environment, intent.client_order_id)
         with self._lock:
-            self._load_all()
-            if key in self._outbox:
-                existing = self._outbox[key]
-                if existing.intent_hash != i_hash:
-                    raise ValueError('IDEMPOTENCY_CONFLICT: client_order_id already exists with a different OrderIntent')
-                return existing
+            tx_ctx = self._store.tx() if self._store is not None else nullcontext()
+            with tx_ctx:
+                self._load_all()
+                if key in self._outbox:
+                    existing = self._outbox[key]
+                    if existing.intent_hash != i_hash:
+                        raise ValueError('IDEMPOTENCY_CONFLICT: client_order_id already exists with a different OrderIntent')
+                    return existing
 
-            now = datetime.now(timezone.utc)
-            rec = OrderOutboxRecord(
-                account_id=intent.account_id,
-                client_order_id=intent.client_order_id,
-                intent_hash=i_hash,
-                symbol=intent.symbol.upper(),
-                side=intent.side,
-                qty=intent.qty,
-                order_type=intent.order_type,
-                limit_price=intent.limit_price,
-                time_in_force=intent.time_in_force,
-                environment='paper_external',
-                state='PENDING_SUBMIT',
-                updated_at=now,
-            )
-            # Persist intent BEFORE remote send
-            self._persist(rec)
+                now = datetime.now(timezone.utc)
+                rec = OrderOutboxRecord(
+                    account_id=intent.account_id,
+                    client_order_id=intent.client_order_id,
+                    intent_hash=i_hash,
+                    symbol=intent.symbol.upper(),
+                    side=intent.side,
+                    qty=intent.qty,
+                    order_type=intent.order_type,
+                    limit_price=intent.limit_price,
+                    time_in_force=intent.time_in_force,
+                    environment='paper_external',
+                    state='PENDING_SUBMIT',
+                    updated_at=now,
+                )
+                # Persist intent atomically BEFORE remote send
+                self._persist(rec)
 
         headers = self._headers()
         payload: dict[str, Any] = {
@@ -248,7 +261,7 @@ class AlpacaPaperOMS:
             if own:
                 http.close()
 
-    def reconcile_by_client_id(self, client_order_id: str, *, account_id: str = 'paper_default') -> OrderOutboxRecord:
+    def reconcile_by_client_id(self, client_order_id: str, *, account_id: str | None = None) -> OrderOutboxRecord:
         with self._lock:
             rec = self._get_record(client_order_id, account_id=account_id, environment='paper_external')
         headers = self._headers()
@@ -321,7 +334,7 @@ class AlpacaPaperOMS:
             updated.append(self.reconcile_by_client_id(rec.client_order_id, account_id=rec.account_id))
         return updated
 
-    def cancel_order(self, client_order_id: str, *, account_id: str = 'paper_default') -> OrderOutboxRecord:
+    def cancel_order(self, client_order_id: str, *, account_id: str | None = None) -> OrderOutboxRecord:
         with self._lock:
             rec = self._get_record(client_order_id, account_id=account_id, environment='paper_external')
         if not rec.broker_order_id:
@@ -348,3 +361,70 @@ class AlpacaPaperOMS:
         with self._lock:
             self._load_all()
             return [r.model_dump(mode='json') for r in self._outbox.values()]
+
+    def fetch_account_snapshot(self, *, client: httpx.Client | None = None) -> AccountSnapshot:
+        """Fetch authoritative Alpaca paper account, positions, and open orders; fail closed on any error."""
+        headers = self._headers()
+        http = client or self._client or httpx.Client(timeout=10.0)
+        own = client is None and self._client is None
+        try:
+            try:
+                acc_resp = http.get(f'{self.ALLOWED_HOST}/v2/account', headers=headers)
+                pos_resp = http.get(f'{self.ALLOWED_HOST}/v2/positions', headers=headers)
+                ord_resp = http.get(f'{self.ALLOWED_HOST}/v2/orders', headers=headers, params={'status': 'open'})
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                raise ValueError(f'EXTERNAL_ACCOUNT_UNAVAILABLE: {type(exc).__name__}') from exc
+
+            for label, r in [('account', acc_resp), ('positions', pos_resp), ('orders', ord_resp)]:
+                if r.status_code >= 400:
+                    raise ValueError(f'EXTERNAL_ACCOUNT_UNAVAILABLE: {label} HTTP {r.status_code}')
+
+            acc = acc_resp.json() or {}
+            pos_list = pos_resp.json() or []
+            ord_list = ord_resp.json() or []
+
+            account_id = str(acc.get('id') or acc.get('account_number') or '').strip()
+            status = str(acc.get('status') or '').upper()
+            if not account_id:
+                raise ValueError('EXTERNAL_ACCOUNT_UNAVAILABLE: missing broker account_id')
+
+            cash = float(acc.get('cash', 'nan'))
+            equity = float(acc.get('equity', 'nan'))
+            buying_power = float(acc.get('buying_power', cash))
+            if not (math.isfinite(cash) and math.isfinite(equity) and math.isfinite(buying_power)) or equity <= 0 or cash < 0:
+                raise ValueError('EXTERNAL_ACCOUNT_UNAVAILABLE: invalid account balances')
+
+            positions: dict[str, float] = {}
+            for p in pos_list:
+                sym = str(p.get('symbol') or '').upper()
+                qty = float(p.get('qty', 'nan'))
+                if not sym or not math.isfinite(qty):
+                    raise ValueError('EXTERNAL_ACCOUNT_UNAVAILABLE: invalid position entry')
+                positions[sym] = qty
+
+            integrity_ok = status == 'ACTIVE' and not bool(acc.get('trading_blocked', False))
+            with self._lock:
+                if self._store is not None:
+                    with self._store.tx():
+                        rev = int(self._store.get(f'acct_rev:{account_id}', 0)) + 1
+                        self._store.put(f'acct_rev:{account_id}', rev)
+                else:
+                    rev = 1
+
+            return AccountSnapshot(
+                account_id=account_id,
+                environment='paper_external',
+                status=status,
+                currency=str(acc.get('currency') or 'USD'),
+                cash=cash,
+                equity=equity,
+                buying_power=buying_power,
+                positions=positions,
+                open_orders_count=len(ord_list),
+                account_revision=rev,
+                reconciled_at=datetime.now(timezone.utc),
+                integrity_ok=integrity_ok,
+            )
+        finally:
+            if own:
+                http.close()

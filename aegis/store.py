@@ -16,6 +16,9 @@ class Store:
     @contextmanager
     def tx(self):
         with self.lock:
+            if self.db.in_transaction:
+                yield self
+                return
             self.db.execute('BEGIN IMMEDIATE')
             try:
                 yield self

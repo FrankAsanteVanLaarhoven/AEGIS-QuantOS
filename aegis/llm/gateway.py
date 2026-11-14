@@ -110,30 +110,72 @@ class OpenRouterGateway:
                 })
         return candidates
 
+    @staticmethod
+    def per_token_to_per_million(rate_per_token: float) -> float:
+        """Convert OpenRouter catalog USD/token rate to routing max_price USD/1M tokens."""
+        return round(float(rate_per_token) * 1_000_000.0, 6)
+
+    def _resolve_pricing(self, role: str, model_id: str) -> tuple[float, float, float]:
+        role_lock = ((self.lock.get('roles') or {}).get(role) or {})
+        pricing = role_lock.get('pricing') or ((self.lock.get('pricing') or {}).get(model_id))
+        if not isinstance(pricing, dict) or 'prompt' not in pricing or 'completion' not in pricing:
+            raise OpenRouterError('BLOCKED_PRICING', f'Missing qualified pricing for {role} ({model_id}); billable dispatch blocked')
+        try:
+            p_rate = float(pricing['prompt'])
+            c_rate = float(pricing['completion'])
+            req_charge = float(pricing.get('request') or 0.0)
+        except (TypeError, ValueError) as exc:
+            raise OpenRouterError('BLOCKED_PRICING', f'Invalid pricing format for {model_id}') from exc
+        if not (math.isfinite(p_rate) and math.isfinite(c_rate) and math.isfinite(req_charge)) or p_rate < 0.0 or c_rate < 0.0 or req_charge < 0.0:
+            raise OpenRouterError('BLOCKED_PRICING', f'Non-finite or negative pricing for {model_id}')
+        if p_rate == 0.0 and c_rate == 0.0 and req_charge == 0.0 and not pricing.get('free'):
+            raise OpenRouterError('BLOCKED_PRICING', f'Zero pricing without explicit free-tier qualification for {model_id}')
+        updated_raw = pricing.get('updated_at')
+        if updated_raw:
+            try:
+                updated_dt = datetime.fromisoformat(str(updated_raw).replace('Z', '+00:00'))
+                max_age_h = float(self.policy.get('max_pricing_age_hours', 168.0))
+                age_h = (datetime.now(timezone.utc) - updated_dt.astimezone(timezone.utc)).total_seconds() / 3600.0
+                if age_h > max_age_h:
+                    raise OpenRouterError('BLOCKED_PRICING', f'Stale pricing ({age_h:.1f}h > {max_age_h:.1f}h) for {model_id}')
+            except ValueError as exc:
+                raise OpenRouterError('BLOCKED_PRICING', f'Invalid pricing updated_at timestamp for {model_id}') from exc
+        return p_rate, c_rate, req_charge
+
     def _estimate_reservation_usd(
         self,
         role: str,
         model_id: str,
         messages: list[dict[str, str]],
         explicit_usd: float | None,
-    ) -> float:
+        *,
+        response_format: dict[str, Any] | None = None,
+        allowed_tools: list[str] | None = None,
+    ) -> tuple[float, dict[str, float]]:
+        p_rate, c_rate, req_charge = self._resolve_pricing(role, model_id)
+        role_cfg = ((self.policy.get('roles') or {}).get(role) or {})
+        max_tokens = int(role_cfg.get('maximum_output_tokens', 1024))
+        serialized = json.dumps(
+            {'messages': messages, 'response_format': response_format or {}, 'tools': allowed_tools or []},
+            sort_keys=True,
+            separators=(',', ':'),
+        )
+        # Conservative byte/char upper-bound (1 token per 2 chars + framing overhead); not a BPE claim.
+        input_tokens_bound = math.ceil(len(serialized) / 2.0) + 128
+        computed_bound = max(1e-6, round(input_tokens_bound * p_rate + max_tokens * c_rate + req_charge, 9))
         if explicit_usd is not None:
             est = float(explicit_usd)
             if not math.isfinite(est) or est <= 0.0:
                 raise OpenRouterError('BLOCKED_BUDGET', 'estimated_usd must be finite and positive')
-            return est
-        role_cfg = ((self.policy.get('roles') or {}).get(role) or {})
-        max_tokens = int(role_cfg.get('maximum_output_tokens', 1024))
-        prompt_tokens = max(1, sum(len(str(m.get('content', ''))) for m in messages) // 3 + 64)
-        role_lock = ((self.lock.get('roles') or {}).get(role) or {})
-        pricing = role_lock.get('pricing') or ((self.lock.get('pricing') or {}).get(model_id))
-        if isinstance(pricing, dict) and 'prompt' in pricing and 'completion' in pricing:
-            p_rate = float(pricing['prompt'])
-            c_rate = float(pricing['completion'])
-            if math.isfinite(p_rate) and math.isfinite(c_rate) and p_rate >= 0.0 and c_rate >= 0.0:
-                return max(1e-6, prompt_tokens * p_rate + max_tokens * c_rate)
-        # Fallback conservative upper-bound scaled by configured max output tokens when lock lacks pricing
-        return max(0.001, round((prompt_tokens + max_tokens) * 1e-5, 6))
+            # Caller may increase the reservation, never undercut the computed conservative bound.
+            final_est = max(computed_bound, est)
+        else:
+            final_est = computed_bound
+        max_price = {
+            'prompt': self.per_token_to_per_million(p_rate),
+            'completion': self.per_token_to_per_million(c_rate),
+        }
+        return final_est, max_price
 
     def complete_structured(
         self,
@@ -156,32 +198,43 @@ class OpenRouterGateway:
         if not model_id:
             raise OpenRouterError('BLOCKED_MODEL_CONFIGURATION', f'No locked model configured for role {role}')
 
-        reserved_estimate = self._estimate_reservation_usd(role, model_id, messages, estimated_usd)
+        schema_cls: type[BaseModel] = ROLE_SCHEMAS[role]
+        response_format = {
+            'type': 'json_schema',
+            'json_schema': {
+                'name': f'aegis_{role}',
+                'strict': True,
+                'schema': schema_cls.model_json_schema(),
+            },
+        }
+        reserved_estimate, max_price = self._estimate_reservation_usd(
+            role,
+            model_id,
+            messages,
+            estimated_usd,
+            response_format=response_format,
+            allowed_tools=allowed_tools,
+        )
         try:
             res = self.budget.reserve(job_id, reserved_estimate)
         except (BudgetExceeded, ValueError) as exc:
             raise OpenRouterError('BLOCKED_BUDGET', str(exc)) from exc
 
-        schema_cls: type[BaseModel] = ROLE_SCHEMAS[role]
         provider_prefs = self.policy.get('provider') or {}
+        provider_routing: dict[str, Any] = {
+            'require_parameters': provider_prefs.get('require_parameters', True),
+            'data_collection': provider_prefs.get('data_collection', 'deny'),
+            'zdr': provider_prefs.get('zdr', True),
+            'allow_fallbacks': provider_prefs.get('allow_fallbacks', False),
+        }
+        if max_price['prompt'] > 0 or max_price['completion'] > 0:
+            provider_routing['max_price'] = max_price
         payload = {
             'model': model_id,
             'messages': messages,
             'max_tokens': ((self.policy.get('roles') or {}).get(role) or {}).get('maximum_output_tokens', 1024),
-            'response_format': {
-                'type': 'json_schema',
-                'json_schema': {
-                    'name': f'aegis_{role}',
-                    'strict': True,
-                    'schema': schema_cls.model_json_schema(),
-                },
-            },
-            'provider': {
-                'require_parameters': provider_prefs.get('require_parameters', True),
-                'data_collection': provider_prefs.get('data_collection', 'deny'),
-                'zdr': provider_prefs.get('zdr', True),
-                'allow_fallbacks': provider_prefs.get('allow_fallbacks', False),
-            },
+            'response_format': response_format,
+            'provider': provider_routing,
         }
         url = f"{self.settings.openrouter_base_url.rstrip('/')}/chat/completions"
         own = self._client is None

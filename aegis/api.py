@@ -12,7 +12,7 @@ from fastapi.exceptions import RequestValidationError
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, ConfigDict, Field
 from .engine import Service
-from .data import from_csv
+from .data import Dataset, from_csv
 from .quant import bootstrap, correlation, valuation
 from .research import backtest
 from .quant_eval import evaluate_candidates
@@ -20,6 +20,7 @@ from . import kronos_adapter as kronos
 from .connectors import connector_status, sec_filings, alpaca_read
 from .settings import build_runtime_context
 from .doctor import run_doctor
+from .market.read_model import MarketReadModel
 from .market.supervisor import MarketDataSupervisor
 from .providers.alpaca_market import AlpacaMarketAdapter
 from .providers.evidence import EvidenceStore
@@ -30,6 +31,7 @@ from .jobs.queue import DurableJobManager
 from .agents.coordinator import ResearchCoordinator
 from .risk.policy import DEFAULT_PROFILES, IndependentRiskGate, OrderIntent
 from .brokers.alpaca_paper import AlpacaPaperOMS
+from .brokers.context import OrderAuthorizationContext
 
 ROOT=Path(__file__).resolve().parents[1]
 class Model(BaseModel): model_config=ConfigDict(extra='forbid',allow_inf_nan=False)
@@ -37,6 +39,7 @@ class Login(Model): token:str=Field(max_length=200)
 class Step(Model): count:int=Field(default=1,ge=1,le=100)
 class Order(Model):
     symbol:str=Field(max_length=12); side:Literal['BUY','SELL']; qty:int=Field(strict=True,ge=1,le=100000); client_id:str=Field(min_length=1,max_length=100); stop:float|None=None; target:float|None=None
+    order_type:Literal['market','limit']='market'; limit_price:float|None=Field(default=None,gt=0)
 class Config(Model):
     strategy:Literal['trend','reversion','ensemble']|None=None; auto_orders:bool|None=None; running:bool|None=None; interval_seconds:float|None=Field(default=None,ge=.5,le=30)
 class Halt(Model): enabled:bool=True
@@ -53,6 +56,9 @@ class AgentJob(Model):
     numerical_inputs:dict[str,float]|None=None
 
 def create_app(db_path=None,token=None):
+    wc=os.environ.get('WEB_CONCURRENCY','1')
+    if wc.isdigit() and int(wc)>1 and os.environ.get('AEGIS_ALLOW_MULTIWORKER','').lower()!='true':
+        raise RuntimeError('MULTIWORKER_BLOCKED: single-worker operational mode enforced until multiworker qualification is proven')
     settings,resolver=build_runtime_context()
     service=Service(db_path or str(settings.db_path))
     auth_token=token or resolver.resolve('AEGIS_TOKEN') or secrets.token_urlsafe(32)
@@ -78,6 +84,7 @@ def create_app(db_path=None,token=None):
         stream_task=None
         if settings.data_mode in ('live','delayed') and alpaca_market.credentials() is not None:
             def _persist_market_event(ev):
+                market_read_model.ingest_event(ev)
                 with service.store.tx():
                     service.store.append('market.event',ev.model_dump(mode='json'))
             stream_task=asyncio.create_task(alpaca_market.run_stream(list(service.dataset.symbols),on_event=_persist_market_event,stop_event=stream_stop))
@@ -95,6 +102,7 @@ def create_app(db_path=None,token=None):
     if not (resolver.resolve('ALPACA_API_KEY') and resolver.resolve('ALPACA_SECRET_KEY')) and settings.data_mode in ('live','delayed'):
         supervisor.mark_blocked_credential('Alpaca market-data credentials missing')
     alpaca_market=AlpacaMarketAdapter(settings,resolver,supervisor)
+    market_read_model=MarketReadModel(service.store)
     evidence_store=EvidenceStore(store=service.store)
     sec_adapter=SecEdgarAdapter(settings)
     llm_gateway=OpenRouterGateway(settings,resolver,store=service.store)
@@ -102,7 +110,7 @@ def create_app(db_path=None,token=None):
     coordinator=ResearchCoordinator(evidence_store,llm_gateway)
     risk_gate=IndependentRiskGate(store=service.store)
     paper_oms=AlpacaPaperOMS(settings,resolver,store=service.store,risk_gate=risk_gate)
-    app.state.service=service; app.state.token=auth_token; app.state.settings=settings; app.state.secrets=resolver; app.state.market_supervisor=supervisor; app.state.alpaca_market=alpaca_market; app.state.evidence_store=evidence_store; app.state.llm_gateway=llm_gateway; app.state.job_manager=job_manager; app.state.paper_oms=paper_oms; app.state.risk_gate=risk_gate
+    app.state.service=service; app.state.token=auth_token; app.state.settings=settings; app.state.secrets=resolver; app.state.market_supervisor=supervisor; app.state.alpaca_market=alpaca_market; app.state.market_read_model=market_read_model; app.state.evidence_store=evidence_store; app.state.llm_gateway=llm_gateway; app.state.job_manager=job_manager; app.state.paper_oms=paper_oms; app.state.risk_gate=risk_gate
     app.add_middleware(TrustedHostMiddleware,allowed_hosts=['localhost','127.0.0.1','testserver','[::1]'])
     @app.middleware('http')
     async def boundary(request:Request,call_next):
@@ -148,11 +156,25 @@ def create_app(db_path=None,token=None):
     def logout(request:Request):
         sessions.pop(request.cookies.get('aegis_session'),None); r=JSONResponse({'ok':True}); r.delete_cookie('aegis_session'); return r
     @app.get('/api/state')
-    def state():return service.snapshot()
+    def state():
+        snap=service.snapshot()
+        if settings.data_mode!='synthetic':
+            sup=supervisor.status()
+            msnap=market_read_model.snapshot(source_mode=settings.data_mode,feed=settings.alpaca_data_feed,feed_state=str(sup['state']),max_age_seconds=risk_gate.profile.max_data_age_seconds)
+            snap['mode']=f'{settings.data_mode.upper()}_MARKET'
+            snap['data_status']=sup['state']
+            snap['dataset']['source']=f'market_read_model:{settings.data_mode}'
+            snap['scanner']=market_read_model.scanner(source_mode=settings.data_mode)
+            snap['market_snapshot']=msnap.model_dump(mode='json')
+        return snap
     @app.get('/api/market/feed/status')
     def market_feed_status():return supervisor.status()
     @app.get('/api/market/{symbol}')
     def market(symbol:str):
+        sym=symbol.upper()
+        if settings.data_mode!='synthetic':
+            bars=market_read_model.bars(sym,source_mode=settings.data_mode,limit=240)
+            return {'symbol':sym,'source':f'market_read_model:{settings.data_mode}','source_mode':settings.data_mode,'status':supervisor.status()['state'],'bars':bars,'asof':bars[-1]['time'] if bars else None}
         with service.store.lock:
             s=service.s()
             if symbol not in service.dataset.symbols: raise ValueError('Unknown symbol')
@@ -161,18 +183,28 @@ def create_app(db_path=None,token=None):
     def order(body:Order):
         if settings.execution_mode=='paper_external':
             from datetime import datetime,timedelta,timezone
-            snap=service.snapshot()
-            marks={sym:float(q['close']) for sym,q in snap.get('quotes',{}).items() if 'close' in q}
-            price=marks.get(body.symbol.upper())
-            if not price: raise ValueError('Unknown symbol or missing mark')
-            positions={sym:float(pos.get('qty',0.0)) for sym,pos in snap.get('positions',{}).items()}
-            acct=snap.get('account',{})
+            if settings.data_mode=='synthetic':
+                raise ValueError('MARKET_INTEGRITY_FAILED: synthetic market data cannot authorize paper_external orders')
             now=datetime.now(timezone.utc)
-            intent=OrderIntent(environment='paper_external',symbol=body.symbol.upper(),side=body.side,qty=float(body.qty),client_order_id=body.client_id,expires_at=now+timedelta(minutes=5),data_age_seconds=float(supervisor.snapshot().get('data_age_seconds') or 0.0))
-            decision=risk_gate.evaluate(intent,price=price,equity=float(acct.get('equity',0.0)),cash=float(acct.get('cash',0.0)),positions=positions,marks=marks,halted=bool(snap.get('halted',False)),integrity_ok=bool(snap.get('integrity_ok',True)),now=now)
-            if not decision.approved: raise ValueError('RISK_REJECTED: '+','.join(decision.reasons))
-            return {'mode':'paper_external','decision':decision.model_dump(mode='json'),'order':paper_oms.submit_order(intent,decision).model_dump(mode='json')}
-        return service.submit(**body.model_dump())
+            sup=supervisor.status(now)
+            msnap=market_read_model.snapshot(source_mode=settings.data_mode,feed=settings.alpaca_data_feed,feed_state=str(sup['state']),max_age_seconds=risk_gate.profile.max_data_age_seconds,now=now)
+            if not msnap.integrity_ok:
+                raise ValueError(f"MARKET_INTEGRITY_FAILED: feed={msnap.feed_state} marks={len(msnap.marks)}")
+            sym=body.symbol.upper()
+            mark=msnap.marks.get(sym)
+            if mark is None or mark.stale or mark.age_seconds is None or mark.price<=0:
+                raise ValueError(f'STALE_OR_MISSING_MARK: {sym}')
+            acct=paper_oms.fetch_account_snapshot()
+            if not acct.integrity_ok:
+                raise ValueError(f'EXTERNAL_ACCOUNT_UNHEALTHY: status={acct.status}')
+            auth_ctx=OrderAuthorizationContext(account=acct,market=msnap,policy_version=risk_gate.profile.profile_id)
+            intent=OrderIntent(account_id=acct.account_id,environment='paper_external',symbol=sym,side=body.side,qty=float(body.qty),order_type=body.order_type,limit_price=body.limit_price,client_order_id=body.client_id,expires_at=now+timedelta(minutes=5),data_age_seconds=float(mark.age_seconds),policy_version=risk_gate.profile.profile_id)
+            marks_dict={s:m.price for s,m in msnap.marks.items()}
+            decision=risk_gate.evaluate(intent,price=mark.price,equity=acct.equity,cash=acct.cash,positions=acct.positions,marks=marks_dict,halted=False,integrity_ok=acct.integrity_ok and msnap.integrity_ok,account_revision=acct.account_revision,now=now)
+            if not decision.approved or decision.intent_hash!=intent.intent_hash():
+                raise ValueError('RISK_REJECTED: '+','.join(decision.reasons))
+            return {'mode':'paper_external','authorization_context':auth_ctx.model_dump(mode='json'),'decision':decision.model_dump(mode='json'),'order':paper_oms.submit_order(intent,decision).model_dump(mode='json')}
+        return service.submit(**body.model_dump(exclude={'order_type','limit_price'}))
     @app.post('/api/orders/{ident}/cancel')
     def cancel(ident:str):return service.cancel(ident)
     @app.post('/api/replay/step')
@@ -215,7 +247,16 @@ def create_app(db_path=None,token=None):
     def forecast(body:Forecast):
         if not heavy.acquire(False):raise HTTPException(409,'A research job is already running')
         try:
-            s=service.s(); result=kronos.forecast(service.dataset,s['index'],**body.model_dump())
+            if settings.data_mode!='synthetic':
+                sym=body.symbol.upper()
+                bars=market_read_model.bars(sym,source_mode=settings.data_mode,limit=240)
+                if len(bars)<24: raise ValueError(f'INSUFFICIENT_LIVE_BARS: need at least 24 bars for {sym}, have {len(bars)}')
+                rows=[{'symbol':sym,'time':b['time'],'open':b['open'],'high':b['high'],'low':b['low'],'close':b['close'],'volume':b['volume']} for b in bars]
+                ds=Dataset(rows=rows,label=f'{sym} {settings.data_mode} read-model',source=f'market_read_model:{settings.data_mode}')
+                result=kronos.forecast(ds,len(bars)-1,**body.model_dump())
+                result['input_bar_hashes']=[b['raw_payload_hash'] for b in bars[-10:]]
+            else:
+                s=service.s(); result=kronos.forecast(service.dataset,s['index'],**body.model_dump())
             with service.store.tx(): result=service.store.result('forecast',result); service.store.append('model.forecast_completed',{'id':result['id'],'model':result['model'],'execution_eligible':result['execution_eligible']})
             return result
         finally:heavy.release()

@@ -63,7 +63,11 @@ def _make_gateway(tmp_path: Path, handler, *, paid: bool = True, key: str | None
     lock_file = tmp_path / 'lock.json'
     lock_file.write_text(json.dumps({
         'schema_version': 1,
-        'roles': {'filing_extractor': {'model_id': 'openai/gpt-test-locked', 'approved_fallbacks': []}},
+        'roles': {'filing_extractor': {
+            'model_id': 'openai/gpt-test-locked',
+            'approved_fallbacks': [],
+            'pricing': {'prompt': '0.000002', 'completion': '0.000006'},
+        }},
     }), encoding='utf-8')
     env = {
         'AEGIS_ENABLE_PAID_LLM': 'true' if paid else 'false',
@@ -202,5 +206,94 @@ def test_gateway_uses_pricing_from_lock_for_reservation(tmp_path: Path):
         gw.complete_structured(job_id='j_price', role='filing_extractor', messages=[{'role': 'user', 'content': 'Extract'}])
     assert exc.value.code == 'BLOCKED_BUDGET'
     assert called['n'] == 0
+
+
+def test_f4_blocks_missing_or_stale_pricing_and_prevents_caller_undercut(tmp_path: Path):
+    # 1. Missing pricing blocks dispatch with 0 HTTP calls
+    lock_missing = tmp_path / 'lock_missing.json'
+    lock_missing.write_text(json.dumps({
+        'schema_version': 1,
+        'roles': {'filing_extractor': {'model_id': 'openai/gpt-test', 'approved_fallbacks': []}},
+    }), encoding='utf-8')
+    called = {'n': 0}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        called['n'] += 1
+        body = json.loads(req.content)
+        called['provider'] = body['provider']
+        return httpx.Response(200, json={
+            'model': 'openai/gpt-test',
+            'usage': {'cost': 0.002},
+            'choices': [{'message': {'content': json.dumps({
+                'symbol': 'NVDA', 'period': '2026Q3', 'claims': ['ok'],
+                'cited_evidence_ids': ['sec:1'], 'abstain': False, 'abstain_reason': None,
+            })}}],
+        })
+
+    gw_missing = OpenRouterGateway(
+        AegisSettings.from_env({'AEGIS_ENABLE_PAID_LLM': 'true', 'AEGIS_OPENROUTER_MODELS_LOCK': str(lock_missing)}),
+        SecretResolver({'OPENROUTER_API_KEY': 'sk-or-v1-test-key'}),
+        budget=BudgetLedger(job_budget_usd=1.0, daily_budget_usd=1.0, project_budget_usd=1.0),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    with pytest.raises(OpenRouterError) as exc:
+        gw_missing.complete_structured(job_id='j_miss', role='filing_extractor', messages=[{'role': 'user', 'content': 'x'}])
+    assert exc.value.code == 'BLOCKED_PRICING'
+    assert called['n'] == 0
+
+    # 2. Stale pricing blocks dispatch
+    lock_stale = tmp_path / 'lock_stale.json'
+    lock_stale.write_text(json.dumps({
+        'schema_version': 1,
+        'roles': {'filing_extractor': {
+            'model_id': 'openai/gpt-test',
+            'approved_fallbacks': [],
+            'pricing': {'prompt': '0.000002', 'completion': '0.000006', 'updated_at': '2020-01-01T00:00:00Z'},
+        }},
+    }), encoding='utf-8')
+    gw_stale = OpenRouterGateway(
+        AegisSettings.from_env({'AEGIS_ENABLE_PAID_LLM': 'true', 'AEGIS_OPENROUTER_MODELS_LOCK': str(lock_stale)}),
+        SecretResolver({'OPENROUTER_API_KEY': 'sk-or-v1-test-key'}),
+        budget=BudgetLedger(job_budget_usd=1.0, daily_budget_usd=1.0, project_budget_usd=1.0),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    with pytest.raises(OpenRouterError) as exc_stale:
+        gw_stale.complete_structured(job_id='j_stale', role='filing_extractor', messages=[{'role': 'user', 'content': 'x'}])
+    assert exc_stale.value.code == 'BLOCKED_PRICING'
+    assert called['n'] == 0
+
+    # 3. Caller cannot undercut computed bound, and max_price uses USD/1M tokens
+    lock_ok = tmp_path / 'lock_ok.json'
+    lock_ok.write_text(json.dumps({
+        'schema_version': 1,
+        'roles': {'filing_extractor': {
+            'model_id': 'openai/gpt-test',
+            'approved_fallbacks': [],
+            'pricing': {'prompt': '0.000002', 'completion': '0.000006'},
+        }},
+    }), encoding='utf-8')
+    gw_ok = OpenRouterGateway(
+        AegisSettings.from_env({'AEGIS_ENABLE_PAID_LLM': 'true', 'AEGIS_OPENROUTER_MODELS_LOCK': str(lock_ok)}),
+        SecretResolver({'OPENROUTER_API_KEY': 'sk-or-v1-test-key'}),
+        budget=BudgetLedger(job_budget_usd=0.001, daily_budget_usd=1.0, project_budget_usd=1.0),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    # Even if caller passes tiny estimated_usd=0.0001, computed bound (>0.006) exceeds job_budget_usd=0.001 -> blocked!
+    with pytest.raises(OpenRouterError) as exc_under:
+        gw_ok.complete_structured(job_id='j_under', role='filing_extractor', messages=[{'role': 'user', 'content': 'x'}], estimated_usd=0.0001)
+    assert exc_under.value.code == 'BLOCKED_BUDGET'
+    assert called['n'] == 0
+
+    # With sufficient budget, max_price is converted to per-1M tokens (2.0 prompt, 6.0 completion)
+    gw_pass = OpenRouterGateway(
+        AegisSettings.from_env({'AEGIS_ENABLE_PAID_LLM': 'true', 'AEGIS_OPENROUTER_MODELS_LOCK': str(lock_ok)}),
+        SecretResolver({'OPENROUTER_API_KEY': 'sk-or-v1-test-key'}),
+        budget=BudgetLedger(job_budget_usd=1.0, daily_budget_usd=1.0, project_budget_usd=1.0),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    res = gw_pass.complete_structured(job_id='j_ok', role='filing_extractor', messages=[{'role': 'user', 'content': 'x'}])
+    assert res['status'] == 'OK'
+    assert called['provider']['max_price'] == {'prompt': 2.0, 'completion': 6.0}
+
 
 

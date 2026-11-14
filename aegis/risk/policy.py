@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import math
 import threading
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from typing import Any, Literal
 
@@ -56,7 +57,13 @@ class OrderIntent(BaseModel):
         return value
 
     def intent_hash(self) -> str:
-        return hashlib.sha256(self.model_dump_json().encode('utf-8')).hexdigest()
+        payload = self.model_dump(
+            mode='json',
+            exclude={'expires_at', 'data_age_seconds'},
+        )
+        return hashlib.sha256(
+            __import__('json').dumps(payload, sort_keys=True, separators=(',', ':')).encode('utf-8')
+        ).hexdigest()
 
 
 class RiskProfile(BaseModel):
@@ -191,6 +198,50 @@ class IndependentRiskGate:
         reasons: list[str] = []
 
         with self._lock:
+            tx_ctx = self._store.tx() if self._store is not None else nullcontext()
+            with tx_ctx:
+                return self._evaluate_locked(
+                    intent,
+                    price=price,
+                    equity=equity,
+                    cash=cash,
+                    positions=positions,
+                    marks=marks,
+                    daily_pnl_pct=daily_pnl_pct,
+                    total_drawdown_pct=total_drawdown_pct,
+                    halted=halted,
+                    integrity_ok=integrity_ok,
+                    account_revision=account_revision,
+                    now_utc=now_utc,
+                    sym=sym,
+                    i_hash=i_hash,
+                    order_key=order_key,
+                    checks=checks,
+                    reasons=reasons,
+                )
+
+    def _evaluate_locked(
+        self,
+        intent: OrderIntent,
+        *,
+        price: float,
+        equity: float,
+        cash: float,
+        positions: dict[str, float],
+        marks: dict[str, float] | None,
+        daily_pnl_pct: float,
+        total_drawdown_pct: float,
+        halted: bool,
+        integrity_ok: bool,
+        account_revision: int,
+        now_utc: datetime,
+        sym: str,
+        i_hash: str,
+        order_key: str,
+        checks: list[str],
+        reasons: list[str],
+    ) -> RiskDecision:
+        if True:
             self._load_from_store()
 
             existing = self._buy_reservations.get(order_key) or self._sell_reservations.get(order_key)
@@ -365,21 +416,25 @@ class IndependentRiskGate:
     def release_order_reservation(self, account_id: str, environment: str, client_order_id: str) -> None:
         key = self._order_key(account_id, environment, client_order_id)
         with self._lock:
-            self._load_from_store()
-            changed = False
-            if key in self._buy_reservations:
-                del self._buy_reservations[key]
-                changed = True
-            if key in self._sell_reservations:
-                del self._sell_reservations[key]
-                changed = True
-            if changed:
-                self._persist_to_store()
+            tx_ctx = self._store.tx() if self._store is not None else nullcontext()
+            with tx_ctx:
+                self._load_from_store()
+                changed = False
+                if key in self._buy_reservations:
+                    del self._buy_reservations[key]
+                    changed = True
+                if key in self._sell_reservations:
+                    del self._sell_reservations[key]
+                    changed = True
+                if changed:
+                    self._persist_to_store()
 
     def release_reservation(self, symbol: str, notional: float) -> None:
         with self._lock:
-            self._load_from_store()
-            sym = symbol.upper()
-            cur = self._legacy_symbol_notional.get(sym, 0.0)
-            self._legacy_symbol_notional[sym] = max(0.0, cur - float(notional))
-            self._persist_to_store()
+            tx_ctx = self._store.tx() if self._store is not None else nullcontext()
+            with tx_ctx:
+                self._load_from_store()
+                sym = symbol.upper()
+                cur = self._legacy_symbol_notional.get(sym, 0.0)
+                self._legacy_symbol_notional[sym] = max(0.0, cur - float(notional))
+                self._persist_to_store()

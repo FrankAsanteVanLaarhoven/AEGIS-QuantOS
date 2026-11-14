@@ -116,6 +116,7 @@ class AegisSettings(BaseModel):
             allow_live_money=False,
             allow_synthetic_fallback=_parse_bool(e.get('AEGIS_SYNTHETIC_FALLBACK'), False),
             alpaca_data_feed=e.get('ALPACA_DATA_FEED', 'iex'),
+            alpaca_stream_url=e.get('AEGIS_ALPACA_STREAM_URL', 'wss://stream.data.alpaca.markets/v2'),
             alpaca_paper_base_url=e.get('ALPACA_PAPER_BASE_URL', 'https://paper-api.alpaca.markets'),
             llm_provider=e.get('AEGIS_LLM_PROVIDER', 'openrouter'),
             enable_paid_llm=_parse_bool(e.get('AEGIS_ENABLE_PAID_LLM'), False),

@@ -1,4 +1,4 @@
-"""Thread-safe, optionally SQLite-persistent reservation-based token and cost budget ledger."""
+"""Database-transactional reservation-based token and cost budget ledger (exact nano-USD accounting)."""
 from __future__ import annotations
 
 import math
@@ -6,25 +6,37 @@ import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
 
+from aegis.store import Store
 
-def _require_finite_positive(value: float, label: str) -> float:
+NANO_PER_USD = 1_000_000_000
+
+
+def _to_nano_positive(value: float, label: str) -> int:
     if isinstance(value, bool):
         raise ValueError(f'{label} must be a finite positive number')
     f = float(value)
     if not math.isfinite(f) or f <= 0.0:
         raise ValueError(f'{label} must be finite and positive')
-    return f
+    nano = int((Decimal(str(f)) * NANO_PER_USD).to_integral_value(rounding=ROUND_HALF_UP))
+    if nano <= 0:
+        raise ValueError(f'{label} must be at least 1e-9 USD')
+    return nano
 
 
-def _require_finite_non_negative(value: float, label: str) -> float:
+def _to_nano_non_negative(value: float, label: str) -> int:
     if isinstance(value, bool):
         raise ValueError(f'{label} must be a finite non-negative number')
     f = float(value)
     if not math.isfinite(f) or f < 0.0:
         raise ValueError(f'{label} must be finite and non-negative')
-    return f
+    return int((Decimal(str(f)) * NANO_PER_USD).to_integral_value(rounding=ROUND_HALF_UP))
+
+
+def _nano_to_usd(nano: int) -> float:
+    return float(Decimal(nano) / Decimal(NANO_PER_USD))
 
 
 @dataclass
@@ -42,9 +54,7 @@ class BudgetExceeded(ValueError):
 
 
 class BudgetLedger:
-    """Enforces per-job, per-day, and project-wide USD caps atomically with originating-day accounting."""
-
-    _STORE_KEY = 'llm_budget_ledger_v1'
+    """Enforces per-job, per-day, and project-wide USD caps atomically inside SQLite transactions."""
 
     def __init__(
         self,
@@ -52,130 +62,187 @@ class BudgetLedger:
         job_budget_usd: float | None = None,
         daily_budget_usd: float | None = None,
         project_budget_usd: float | None = None,
-        store: Any = None,
+        store: Store | None = None,
     ) -> None:
-        self.job_budget_usd = _require_finite_positive(job_budget_usd, 'job_budget_usd') if job_budget_usd is not None else None
-        self.daily_budget_usd = _require_finite_positive(daily_budget_usd, 'daily_budget_usd') if daily_budget_usd is not None else None
-        self.project_budget_usd = _require_finite_positive(project_budget_usd, 'project_budget_usd') if project_budget_usd is not None else None
-        self._store = store
+        self._job_cap_nano = _to_nano_positive(job_budget_usd, 'job_budget_usd') if job_budget_usd is not None else None
+        self._daily_cap_nano = _to_nano_positive(daily_budget_usd, 'daily_budget_usd') if daily_budget_usd is not None else None
+        self._project_cap_nano = _to_nano_positive(project_budget_usd, 'project_budget_usd') if project_budget_usd is not None else None
+        self.job_budget_usd = _nano_to_usd(self._job_cap_nano) if self._job_cap_nano is not None else None
+        self.daily_budget_usd = _nano_to_usd(self._daily_cap_nano) if self._daily_cap_nano is not None else None
+        self.project_budget_usd = _nano_to_usd(self._project_cap_nano) if self._project_cap_nano is not None else None
+        self._store = store if store is not None else Store(':memory:')
         self._lock = threading.RLock()
-        self._reservations: dict[str, BudgetReservation] = {}
-        self._job_spent: dict[str, float] = {}
-        self._daily_spent: dict[str, float] = {}
-        self._project_spent: float = 0.0
-        self._load_from_store()
+        self._ensure_schema()
 
     def _today(self) -> str:
         return datetime.now(timezone.utc).strftime('%Y-%m-%d')
 
-    def _load_from_store(self) -> None:
-        if self._store is None:
-            return
-        raw = self._store.get(self._STORE_KEY)
-        if not isinstance(raw, dict):
-            return
-        self._job_spent = {k: float(v) for k, v in (raw.get('job_spent') or {}).items()}
-        self._daily_spent = {k: float(v) for k, v in (raw.get('daily_spent') or {}).items()}
-        self._project_spent = float(raw.get('project_spent') or 0.0)
-        loaded_res: dict[str, BudgetReservation] = {}
-        for rid, rec in (raw.get('reservations') or {}).items():
-            loaded_res[rid] = BudgetReservation(
-                reservation_id=rec['reservation_id'],
-                job_id=rec['job_id'],
-                reserved_usd=float(rec['reserved_usd']),
-                status=rec['status'],
-                originating_day=rec['originating_day'],
-                actual_usd=float(rec['actual_usd']) if rec.get('actual_usd') is not None else None,
+    def _ensure_schema(self) -> None:
+        with self._store.tx():
+            self._store.db.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS budget_reservations (
+                    reservation_id TEXT PRIMARY KEY,
+                    job_id TEXT NOT NULL,
+                    originating_day TEXT NOT NULL,
+                    reserved_nano INTEGER NOT NULL,
+                    actual_nano INTEGER,
+                    status TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS budget_job_spent (
+                    job_id TEXT PRIMARY KEY,
+                    spent_nano INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS budget_daily_spent (
+                    day TEXT PRIMARY KEY,
+                    spent_nano INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS budget_project_spent (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    spent_nano INTEGER NOT NULL
+                );
+                INSERT OR IGNORE INTO budget_project_spent(id, spent_nano) VALUES (1, 0);
+                """
             )
-        self._reservations = loaded_res
-
-    def _persist_to_store(self) -> None:
-        if self._store is None:
-            return
-        self._store.put(
-            self._STORE_KEY,
-            {
-                'job_spent': self._job_spent,
-                'daily_spent': self._daily_spent,
-                'project_spent': self._project_spent,
-                'reservations': {
-                    rid: {
-                        'reservation_id': r.reservation_id,
-                        'job_id': r.job_id,
-                        'reserved_usd': r.reserved_usd,
-                        'status': r.status,
-                        'originating_day': r.originating_day,
-                        'actual_usd': r.actual_usd,
-                    }
-                    for rid, r in self._reservations.items()
-                },
-            },
-        )
 
     def reserve(self, job_id: str, estimated_usd: float) -> BudgetReservation:
-        est = _require_finite_positive(estimated_usd, 'estimated_usd')
+        est_nano = _to_nano_positive(estimated_usd, 'estimated_usd')
         with self._lock:
-            self._load_from_store()
             day = self._today()
-            if self.job_budget_usd is None or self.daily_budget_usd is None or self.project_budget_usd is None:
+            if self._job_cap_nano is None or self._daily_cap_nano is None or self._project_cap_nano is None:
                 raise BudgetExceeded('BLOCKED_BUDGET: Finite job, daily, and project budgets are required')
-            if self._job_spent.get(job_id, 0.0) + est > self.job_budget_usd + 1e-12:
-                raise BudgetExceeded(f'BLOCKED_BUDGET: Job {job_id} budget exceeded')
-            if self._daily_spent.get(day, 0.0) + est > self.daily_budget_usd + 1e-12:
-                raise BudgetExceeded('BLOCKED_BUDGET: Daily budget exceeded')
-            if self._project_spent + est > self.project_budget_usd + 1e-12:
-                raise BudgetExceeded('BLOCKED_BUDGET: Project budget exceeded')
 
-            rid = str(uuid.uuid4())
-            res = BudgetReservation(
-                reservation_id=rid,
-                job_id=job_id,
-                reserved_usd=est,
-                status='RESERVED',
-                originating_day=day,
-            )
-            self._reservations[rid] = res
-            self._job_spent[job_id] = self._job_spent.get(job_id, 0.0) + est
-            self._daily_spent[day] = self._daily_spent.get(day, 0.0) + est
-            self._project_spent += est
-            self._persist_to_store()
-            return res
+            with self._store.tx():
+                job_row = self._store.db.execute(
+                    'SELECT spent_nano FROM budget_job_spent WHERE job_id = ?', (job_id,)
+                ).fetchone()
+                day_row = self._store.db.execute(
+                    'SELECT spent_nano FROM budget_daily_spent WHERE day = ?', (day,)
+                ).fetchone()
+                proj_row = self._store.db.execute(
+                    'SELECT spent_nano FROM budget_project_spent WHERE id = 1'
+                ).fetchone()
+
+                job_spent = int(job_row['spent_nano']) if job_row else 0
+                day_spent = int(day_row['spent_nano']) if day_row else 0
+                proj_spent = int(proj_row['spent_nano']) if proj_row else 0
+
+                if job_spent + est_nano > self._job_cap_nano:
+                    raise BudgetExceeded(f'BLOCKED_BUDGET: Job {job_id} budget exceeded')
+                if day_spent + est_nano > self._daily_cap_nano:
+                    raise BudgetExceeded('BLOCKED_BUDGET: Daily budget exceeded')
+                if proj_spent + est_nano > self._project_cap_nano:
+                    raise BudgetExceeded('BLOCKED_BUDGET: Project budget exceeded')
+
+                rid = str(uuid.uuid4())
+                self._store.db.execute(
+                    'INSERT INTO budget_reservations(reservation_id, job_id, originating_day, reserved_nano, actual_nano, status) '
+                    'VALUES (?, ?, ?, ?, NULL, ?)',
+                    (rid, job_id, day, est_nano, 'RESERVED'),
+                )
+                self._store.db.execute(
+                    'INSERT INTO budget_job_spent(job_id, spent_nano) VALUES (?, ?) '
+                    'ON CONFLICT(job_id) DO UPDATE SET spent_nano = spent_nano + excluded.spent_nano',
+                    (job_id, est_nano),
+                )
+                self._store.db.execute(
+                    'INSERT INTO budget_daily_spent(day, spent_nano) VALUES (?, ?) '
+                    'ON CONFLICT(day) DO UPDATE SET spent_nano = spent_nano + excluded.spent_nano',
+                    (day, est_nano),
+                )
+                self._store.db.execute(
+                    'UPDATE budget_project_spent SET spent_nano = spent_nano + ? WHERE id = 1',
+                    (est_nano,),
+                )
+                return BudgetReservation(
+                    reservation_id=rid,
+                    job_id=job_id,
+                    reserved_usd=_nano_to_usd(est_nano),
+                    status='RESERVED',
+                    originating_day=day,
+                )
 
     def reconcile(self, reservation_id: str, *, actual_usd: float | None, unknown_outcome: bool = False) -> BudgetReservation:
-        if actual_usd is not None:
-            actual_usd = _require_finite_non_negative(actual_usd, 'actual_usd')
+        actual_nano = _to_nano_non_negative(actual_usd, 'actual_usd') if actual_usd is not None else None
         with self._lock:
-            self._load_from_store()
-            res = self._reservations[reservation_id]
-            if res.status in ('SETTLED', 'RELEASED'):
-                return res
-            if unknown_outcome or actual_usd is None:
-                # Unknown cost is NOT zero: keep full reservation locked until resolved
-                res.status = 'UNKNOWN_OUTCOME'
-                res.actual_usd = res.reserved_usd
-                self._persist_to_store()
-                return res
-            # Booked amount before settlement is res.reserved_usd (for both RESERVED and UNKNOWN_OUTCOME)
-            delta = actual_usd - res.reserved_usd
-            orig_day = res.originating_day
-            self._job_spent[res.job_id] = max(0.0, self._job_spent.get(res.job_id, 0.0) + delta)
-            self._daily_spent[orig_day] = max(0.0, self._daily_spent.get(orig_day, 0.0) + delta)
-            self._project_spent = max(0.0, self._project_spent + delta)
-            res.status = 'SETTLED'
-            res.actual_usd = actual_usd
-            self._persist_to_store()
-            return res
+            with self._store.tx():
+                row = self._store.db.execute(
+                    'SELECT * FROM budget_reservations WHERE reservation_id = ?',
+                    (reservation_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(reservation_id)
+                reserved_nano = int(row['reserved_nano'])
+                job_id = str(row['job_id'])
+                orig_day = str(row['originating_day'])
+                status = str(row['status'])
+
+                if status in ('SETTLED', 'RELEASED'):
+                    return BudgetReservation(
+                        reservation_id=reservation_id,
+                        job_id=job_id,
+                        reserved_usd=_nano_to_usd(reserved_nano),
+                        status=status,
+                        originating_day=orig_day,
+                        actual_usd=_nano_to_usd(int(row['actual_nano'])) if row['actual_nano'] is not None else None,
+                    )
+
+                if unknown_outcome or actual_nano is None:
+                    self._store.db.execute(
+                        'UPDATE budget_reservations SET status = ?, actual_nano = ? WHERE reservation_id = ?',
+                        ('UNKNOWN_OUTCOME', reserved_nano, reservation_id),
+                    )
+                    return BudgetReservation(
+                        reservation_id=reservation_id,
+                        job_id=job_id,
+                        reserved_usd=_nano_to_usd(reserved_nano),
+                        status='UNKNOWN_OUTCOME',
+                        originating_day=orig_day,
+                        actual_usd=_nano_to_usd(reserved_nano),
+                    )
+
+                delta_nano = actual_nano - reserved_nano
+                self._store.db.execute(
+                    'UPDATE budget_job_spent SET spent_nano = MAX(0, spent_nano + ?) WHERE job_id = ?',
+                    (delta_nano, job_id),
+                )
+                self._store.db.execute(
+                    'UPDATE budget_daily_spent SET spent_nano = MAX(0, spent_nano + ?) WHERE day = ?',
+                    (delta_nano, orig_day),
+                )
+                self._store.db.execute(
+                    'UPDATE budget_project_spent SET spent_nano = MAX(0, spent_nano + ?) WHERE id = 1',
+                    (delta_nano,),
+                )
+                self._store.db.execute(
+                    'UPDATE budget_reservations SET status = ?, actual_nano = ? WHERE reservation_id = ?',
+                    ('SETTLED', actual_nano, reservation_id),
+                )
+                return BudgetReservation(
+                    reservation_id=reservation_id,
+                    job_id=job_id,
+                    reserved_usd=_nano_to_usd(reserved_nano),
+                    status='SETTLED',
+                    originating_day=orig_day,
+                    actual_usd=_nano_to_usd(actual_nano),
+                )
 
     def snapshot(self) -> dict[str, object]:
         with self._lock:
-            self._load_from_store()
             day = self._today()
-            return {
-                'job_budget_usd': self.job_budget_usd,
-                'daily_budget_usd': self.daily_budget_usd,
-                'project_budget_usd': self.project_budget_usd,
-                'daily_spent_usd': round(self._daily_spent.get(day, 0.0), 6),
-                'project_spent_usd': round(self._project_spent, 6),
-                'active_reservations': sum(1 for r in self._reservations.values() if r.status == 'RESERVED'),
-                'unknown_outcomes': sum(1 for r in self._reservations.values() if r.status == 'UNKNOWN_OUTCOME'),
-            }
+            with self._store.lock:
+                day_row = self._store.db.execute('SELECT spent_nano FROM budget_daily_spent WHERE day = ?', (day,)).fetchone()
+                proj_row = self._store.db.execute('SELECT spent_nano FROM budget_project_spent WHERE id = 1').fetchone()
+                active_row = self._store.db.execute("SELECT COUNT(*) AS c FROM budget_reservations WHERE status = 'RESERVED'").fetchone()
+                unk_row = self._store.db.execute("SELECT COUNT(*) AS c FROM budget_reservations WHERE status = 'UNKNOWN_OUTCOME'").fetchone()
+                total_row = self._store.db.execute('SELECT COUNT(*) AS c FROM budget_reservations').fetchone()
+                return {
+                    'job_budget_usd': self.job_budget_usd,
+                    'daily_budget_usd': self.daily_budget_usd,
+                    'project_budget_usd': self.project_budget_usd,
+                    'daily_spent_usd': round(_nano_to_usd(int(day_row['spent_nano']) if day_row else 0), 9),
+                    'project_spent_usd': round(_nano_to_usd(int(proj_row['spent_nano']) if proj_row else 0), 9),
+                    'active_reservations': int(active_row['c']) if active_row else 0,
+                    'unknown_outcomes': int(unk_row['c']) if unk_row else 0,
+                    'reservation_count': int(total_row['c']) if total_row else 0,
+                }
