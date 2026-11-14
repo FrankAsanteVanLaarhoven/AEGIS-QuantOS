@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 from datetime import datetime, timezone
 from typing import Any
 
@@ -31,6 +32,7 @@ class OpenRouterGateway:
         *,
         budget: BudgetLedger | None = None,
         client: httpx.Client | None = None,
+        store: Any = None,
     ) -> None:
         self.settings = settings
         self.resolver = resolver
@@ -40,6 +42,7 @@ class OpenRouterGateway:
             job_budget_usd=self.policy.get('job_budget_usd'),
             daily_budget_usd=self.policy.get('daily_budget_usd'),
             project_budget_usd=self.policy.get('project_budget_usd'),
+            store=store,
         )
         self._client = client
 
@@ -107,13 +110,38 @@ class OpenRouterGateway:
                 })
         return candidates
 
+    def _estimate_reservation_usd(
+        self,
+        role: str,
+        model_id: str,
+        messages: list[dict[str, str]],
+        explicit_usd: float | None,
+    ) -> float:
+        if explicit_usd is not None:
+            est = float(explicit_usd)
+            if not math.isfinite(est) or est <= 0.0:
+                raise OpenRouterError('BLOCKED_BUDGET', 'estimated_usd must be finite and positive')
+            return est
+        role_cfg = ((self.policy.get('roles') or {}).get(role) or {})
+        max_tokens = int(role_cfg.get('maximum_output_tokens', 1024))
+        prompt_tokens = max(1, sum(len(str(m.get('content', ''))) for m in messages) // 3 + 64)
+        role_lock = ((self.lock.get('roles') or {}).get(role) or {})
+        pricing = role_lock.get('pricing') or ((self.lock.get('pricing') or {}).get(model_id))
+        if isinstance(pricing, dict) and 'prompt' in pricing and 'completion' in pricing:
+            p_rate = float(pricing['prompt'])
+            c_rate = float(pricing['completion'])
+            if math.isfinite(p_rate) and math.isfinite(c_rate) and p_rate >= 0.0 and c_rate >= 0.0:
+                return max(1e-6, prompt_tokens * p_rate + max_tokens * c_rate)
+        # Fallback conservative upper-bound scaled by configured max output tokens when lock lacks pricing
+        return max(0.001, round((prompt_tokens + max_tokens) * 1e-5, 6))
+
     def complete_structured(
         self,
         *,
         job_id: str,
         role: str,
         messages: list[dict[str, str]],
-        estimated_usd: float = 0.01,
+        estimated_usd: float | None = None,
         allowed_tools: list[str] | None = None,
     ) -> dict[str, Any]:
         if role not in ROLE_SCHEMAS:
@@ -128,9 +156,10 @@ class OpenRouterGateway:
         if not model_id:
             raise OpenRouterError('BLOCKED_MODEL_CONFIGURATION', f'No locked model configured for role {role}')
 
+        reserved_estimate = self._estimate_reservation_usd(role, model_id, messages, estimated_usd)
         try:
-            res = self.budget.reserve(job_id, estimated_usd)
-        except BudgetExceeded as exc:
+            res = self.budget.reserve(job_id, reserved_estimate)
+        except (BudgetExceeded, ValueError) as exc:
             raise OpenRouterError('BLOCKED_BUDGET', str(exc)) from exc
 
         schema_cls: type[BaseModel] = ROLE_SCHEMAS[role]
@@ -213,3 +242,4 @@ class OpenRouterGateway:
         finally:
             if own:
                 http.close()
+

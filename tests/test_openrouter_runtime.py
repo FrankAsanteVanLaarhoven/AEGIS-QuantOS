@@ -145,3 +145,62 @@ def test_gateway_error_classifications_and_no_blind_retry_on_timeout(tmp_path: P
     assert calls['n'] == 1
     assert gw_to.budget.snapshot()['unknown_outcomes'] == 1
     assert gw_to.budget.snapshot()['project_spent_usd'] == 0.05
+
+
+def test_budget_persists_across_restart_and_resolves_unknown_outcome(tmp_path: Path):
+    from aegis.store import Store
+
+    db = tmp_path / 'budget.sqlite'
+    b1 = BudgetLedger(job_budget_usd=0.20, daily_budget_usd=0.20, project_budget_usd=0.20, store=Store(db))
+    b1._today = lambda: '2026-11-14'
+    res = b1.reserve('job_a', 0.12)
+    b1.reconcile(res.reservation_id, actual_usd=None, unknown_outcome=True)
+
+    # Restart with fresh BudgetLedger instance against same SQLite file on next UTC day
+    b2 = BudgetLedger(job_budget_usd=0.20, daily_budget_usd=0.20, project_budget_usd=0.20, store=Store(db))
+    b2._today = lambda: '2026-11-15'
+    assert b2.snapshot()['project_spent_usd'] == pytest.approx(0.12)
+    assert b2.snapshot()['unknown_outcomes'] == 1
+
+    # Exceeding project cap across restart fails
+    with pytest.raises(BudgetExceeded):
+        b2.reserve('job_b', 0.10)
+
+    # Settle unknown outcome on 2026-11-15 -> adjusts originating day 2026-11-14
+    settled = b2.reconcile(res.reservation_id, actual_usd=0.03)
+    assert settled.status == 'SETTLED'
+    assert b2.snapshot()['project_spent_usd'] == pytest.approx(0.03)
+    assert b2.snapshot()['daily_spent_usd'] == pytest.approx(0.0)
+    b2._today = lambda: '2026-11-14'
+    assert b2.snapshot()['daily_spent_usd'] == pytest.approx(0.03)
+
+
+def test_gateway_uses_pricing_from_lock_for_reservation(tmp_path: Path):
+    lock_file = tmp_path / 'models.lock.json'
+    lock_file.write_text(json.dumps({
+        'schema_version': 1,
+        'roles': {
+            'filing_extractor': {
+                'model_id': 'openai/gpt-test-locked',
+                'approved_fallbacks': [],
+                'pricing': {'prompt': '0.0001', 'completion': '0.0002'},
+            },
+        },
+    }), encoding='utf-8')
+    settings = AegisSettings.from_env({'AEGIS_ENABLE_PAID_LLM': 'true', 'AEGIS_OPENROUTER_MODELS_LOCK': str(lock_file)})
+    resolver = SecretResolver({'OPENROUTER_API_KEY': 'sk-or-v1-test-key'})
+    # High token-based estimate (1024 * 0.0002 = 0.2048) exceeds tiny 0.05 budget -> blocked before dispatch
+    budget = BudgetLedger(job_budget_usd=0.05, daily_budget_usd=0.05, project_budget_usd=0.05)
+    called = {'n': 0}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        called['n'] += 1
+        return httpx.Response(200, json={})
+
+    gw = OpenRouterGateway(settings, resolver, budget=budget, client=httpx.Client(transport=httpx.MockTransport(handler)))
+    with pytest.raises(OpenRouterError) as exc:
+        gw.complete_structured(job_id='j_price', role='filing_extractor', messages=[{'role': 'user', 'content': 'Extract'}])
+    assert exc.value.code == 'BLOCKED_BUDGET'
+    assert called['n'] == 0
+
+

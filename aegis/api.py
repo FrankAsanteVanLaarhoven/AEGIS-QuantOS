@@ -83,7 +83,7 @@ def create_app(db_path=None,token=None):
     alpaca_market=AlpacaMarketAdapter(settings,resolver,supervisor)
     evidence_store=EvidenceStore()
     sec_adapter=SecEdgarAdapter(settings)
-    llm_gateway=OpenRouterGateway(settings,resolver)
+    llm_gateway=OpenRouterGateway(settings,resolver,store=service.store)
     job_manager=DurableJobManager()
     coordinator=ResearchCoordinator(evidence_store,llm_gateway)
     risk_gate=IndependentRiskGate(store=service.store)
