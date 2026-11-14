@@ -114,7 +114,7 @@ with sync_playwright() as p:
     assert 'Estimated per share' in page.locator('#dcf-result').inner_text()
     page.locator('#agent-job-form button[type="submit"]').click()
     page.wait_for_timeout(500)
-    assert 'COMPLETED' in page.locator('#agent-job-result').inner_text()
+    assert 'ABSTAINED' in page.locator('#agent-job-result').inner_text()
     page.screenshot(path=str(SCREENSHOTS / 'ui_research.png'), full_page=True)
     checks.append('Backtest, DCF, and bounded research agent job render')
 

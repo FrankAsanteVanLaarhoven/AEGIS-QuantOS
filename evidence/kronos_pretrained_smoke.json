@@ -1,0 +1,66 @@
+{
+  "model": "NeoQuasar/Kronos-mini",
+  "source_commit": "67b630e67f6a18c9e9be918d9b4337c960db1e9a",
+  "model_revision": "f4e68697d9d5aed55cef5c96aabc3376bcad9f81",
+  "tokenizer_revision": "26966d0035065a0cae0ebad7af8ece35bc1fb51c",
+  "dataset_id": "81d28c22929976d6b7a1",
+  "asof": "2026-11-02T19:30:00Z",
+  "symbol": "NVDA",
+  "horizon": 4,
+  "samples": 2,
+  "seed": 26,
+  "bands": [
+    {
+      "step": 1,
+      "timestamp": "2026-11-03T14:34:59+00:00",
+      "low": 132.59722671508788,
+      "median": 132.66545867919922,
+      "high": 132.73369064331055
+    },
+    {
+      "step": 2,
+      "timestamp": "2026-11-03T14:39:59+00:00",
+      "low": 131.95106811523436,
+      "median": 132.24264526367188,
+      "high": 132.5342224121094
+    },
+    {
+      "step": 3,
+      "timestamp": "2026-11-03T14:44:59+00:00",
+      "low": 132.28572616577148,
+      "median": 132.35457611083984,
+      "high": 132.4234260559082
+    },
+    {
+      "step": 4,
+      "timestamp": "2026-11-03T14:49:59+00:00",
+      "low": 132.3924644470215,
+      "median": 132.76538848876953,
+      "high": 133.13831253051757
+    }
+  ],
+  "paths": [
+    [
+      132.5896453857422,
+      132.56661987304688,
+      132.278076171875,
+      133.17974853515625
+    ],
+    [
+      132.74127197265625,
+      131.91867065429688,
+      132.4310760498047,
+      132.3510284423828
+    ]
+  ],
+  "latency_seconds": 0.07902034802827984,
+  "input_hash": "7e66472b248ec47c0cd4f096ae8e91286ed084c490bfd30fdffbd6cdc7d3988f",
+  "ohlcv_violations": 0,
+  "ohlcv_valid": true,
+  "execution_eligible": false,
+  "calibrated": false,
+  "amount_source": "Upstream proxy: volume \u00d7 mean(open, high, low, close)",
+  "future_information": "Calendar timestamps only; no future OHLCV supplied",
+  "status": "REAL_PRETRAINED_KRONOS",
+  "limitation": "Empirical quantiles from a small sample, not calibrated prediction intervals. Reproducibility is within the same software/hardware, not bit-exact across GPUs."
+}
