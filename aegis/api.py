@@ -25,6 +25,8 @@ from .providers.evidence import EvidenceStore
 from .providers.sec import SecEdgarAdapter
 from .providers.registry import provider_registry
 from .llm.gateway import OpenRouterGateway
+from .jobs.queue import DurableJobManager
+from .agents.coordinator import ResearchCoordinator
 
 ROOT=Path(__file__).resolve().parents[1]
 class Model(BaseModel): model_config=ConfigDict(extra='forbid',allow_inf_nan=False)
@@ -43,6 +45,7 @@ class Upload(Model): label:str=Field(default='Imported dataset',max_length=120);
 class Reset(Model): confirm:str; capital:float=Field(default=100000,ge=1000,le=10000000)
 class Alert(Model): symbol:str; price:float=Field(gt=0); direction:Literal['above','below']
 class DCF(Model): fcf:float=Field(gt=0); growth:float; discount:float; terminal_growth:float; years:int=Field(ge=1,le=15); shares:float=Field(gt=0); debt:float=Field(default=0,ge=0); cash:float=Field(default=0,ge=0)
+class AgentJob(Model): symbol:str=Field(max_length=12); arm:Literal['deterministic_baseline','retrieval_assisted_llm','verified_multi_role']='deterministic_baseline'
 
 def create_app(db_path=None,token=None):
     settings,resolver=build_runtime_context()
@@ -78,7 +81,9 @@ def create_app(db_path=None,token=None):
     evidence_store=EvidenceStore()
     sec_adapter=SecEdgarAdapter(settings)
     llm_gateway=OpenRouterGateway(settings,resolver)
-    app.state.service=service; app.state.token=auth_token; app.state.settings=settings; app.state.secrets=resolver; app.state.market_supervisor=supervisor; app.state.evidence_store=evidence_store; app.state.llm_gateway=llm_gateway
+    job_manager=DurableJobManager()
+    coordinator=ResearchCoordinator(evidence_store,llm_gateway)
+    app.state.service=service; app.state.token=auth_token; app.state.settings=settings; app.state.secrets=resolver; app.state.market_supervisor=supervisor; app.state.evidence_store=evidence_store; app.state.llm_gateway=llm_gateway; app.state.job_manager=job_manager
     app.add_middleware(TrustedHostMiddleware,allowed_hosts=['localhost','127.0.0.1','testserver','[::1]'])
     @app.middleware('http')
     async def boundary(request:Request,call_next):
@@ -217,6 +222,20 @@ def create_app(db_path=None,token=None):
         else:
             docs=[d for d in evidence_store.all_documents() if not symbol or d.entity_symbol==symbol.upper()]
         return {'count':len(docs),'documents':[d.model_dump(mode='json') for d in docs],'registry':provider_registry(settings,resolver)}
+    @app.get('/api/agents/jobs')
+    def list_agent_jobs():return {'jobs':job_manager.list_jobs()}
+    @app.post('/api/agents/jobs')
+    def run_agent_job(body:AgentJob):
+        rec=job_manager.create('research_arm',body.symbol)
+        job_manager.record_step(rec.job_id,'dispatch',{'arm':body.arm})
+        out=coordinator.run_arm(arm=body.arm,job_id=rec.job_id,symbol=body.symbol,numerical_inputs={'fcf':120,'growth':0.08,'discount':0.11,'terminal_growth':0.03,'years':5,'shares':10})
+        st='COMPLETED' if out.get('status')=='COMPLETED' else ('ABSTAINED' if out.get('status')=='ABSTAINED' else 'BLOCKED')
+        job_manager.finish(rec.job_id,st,result=out)
+        return job_manager.get(rec.job_id).model_dump(mode='json')
+    @app.post('/api/agents/jobs/{job_id}/cancel')
+    def cancel_agent_job(job_id:str):
+        if not job_manager.get(job_id): raise HTTPException(404,'Job not found')
+        return job_manager.cancel(job_id).model_dump(mode='json')
     @app.get('/api/llm/status')
     def llm_status():
         return {

@@ -83,7 +83,7 @@ class ResearchAssessment(BaseModel):
     abstain: bool = False
     abstain_reason: str | None = None
     uncertainties: list[str] = Field(default_factory=list)
-    token_usage: dict[str, int] = Field(default_factory=dict)
+    token_usage: dict[str, Any] = Field(default_factory=dict)
     cost_usd: float = Field(default=0.0, ge=0.0)
     policy_status: Literal['APPROVED', 'REJECTED_CITATION', 'REJECTED_SCHEMA', 'ABSTAINED', 'BLOCKED'] = 'APPROVED'
 
