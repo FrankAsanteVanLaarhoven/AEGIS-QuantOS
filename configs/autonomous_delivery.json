@@ -1,0 +1,364 @@
+{
+  "schema_version": 1,
+  "repository": "FrankAsanteVanLaarhoven/AEGIS-QuantOS",
+  "audited_baseline": "b0ec80cbea1e2a78155525fed2b13542d523e9e7",
+  "scope": "v5",
+  "integration_branch": "feat/autonomous-completion",
+  "status": "NOT_STARTED",
+  "real_money_execution_authorized": false,
+  "paid_provider_budget_usd": null,
+  "max_distinct_repairs_per_failure": 3,
+  "tasks": [
+    {
+      "id": "W00",
+      "title": "Baseline audit",
+      "depends_on": [],
+      "target_paths": [
+        "aegis/",
+        "web/",
+        "tests/"
+      ],
+      "required_evidence": [
+        "evidence/current/baseline.json",
+        "fresh baseline tests"
+      ],
+      "status": "NOT_STARTED",
+      "note": "Paths are implementation targets, not claimed present or working.",
+      "gates": [
+        {
+          "id": "baseline_tests",
+          "evidence_kind": "local"
+        }
+      ]
+    },
+    {
+      "id": "W01",
+      "title": "Typed settings and secrets",
+      "depends_on": [
+        "W00"
+      ],
+      "target_paths": [
+        "aegis/settings.py",
+        "aegis/secrets.py",
+        "scripts/run.py",
+        ".gitignore",
+        ".dockerignore"
+      ],
+      "required_evidence": [
+        "redacted doctor",
+        "secret isolation and negative tests"
+      ],
+      "status": "NOT_STARTED",
+      "note": "Paths are implementation targets, not claimed present or working.",
+      "gates": [
+        {
+          "id": "secrets_isolation",
+          "evidence_kind": "local"
+        }
+      ]
+    },
+    {
+      "id": "W02",
+      "title": "Real market data",
+      "depends_on": [
+        "W01"
+      ],
+      "target_paths": [
+        "aegis/market/",
+        "aegis/providers/",
+        "aegis/data.py"
+      ],
+      "required_evidence": [
+        "credentialed stream",
+        "reconnect gap tests",
+        "live session provenance"
+      ],
+      "status": "NOT_STARTED",
+      "note": "Paths are implementation targets, not claimed present or working.",
+      "gates": [
+        {
+          "id": "market_stream",
+          "evidence_kind": "external"
+        },
+        {
+          "id": "market_session_observation",
+          "evidence_kind": "external"
+        }
+      ]
+    },
+    {
+      "id": "W03",
+      "title": "Financial evidence",
+      "depends_on": [
+        "W01"
+      ],
+      "target_paths": [
+        "aegis/providers/",
+        "aegis/connectors.py"
+      ],
+      "required_evidence": [
+        "real SEC evidence",
+        "licensed news evidence",
+        "availability and injection tests"
+      ],
+      "status": "NOT_STARTED",
+      "note": "Paths are implementation targets, not claimed present or working.",
+      "gates": [
+        {
+          "id": "sec_evidence",
+          "evidence_kind": "external"
+        },
+        {
+          "id": "licensed_news",
+          "evidence_kind": "external"
+        }
+      ]
+    },
+    {
+      "id": "W04",
+      "title": "OpenRouter runtime",
+      "depends_on": [
+        "W01"
+      ],
+      "target_paths": [
+        "aegis/llm/",
+        "aegis/api.py",
+        "configs/openrouter.models.lock.json"
+      ],
+      "required_evidence": [
+        "real authenticated structured request",
+        "budget and schema tests",
+        "runtime API proof"
+      ],
+      "status": "NOT_STARTED",
+      "note": "Paths are implementation targets, not claimed present or working.",
+      "gates": [
+        {
+          "id": "openrouter_auth",
+          "evidence_kind": "external"
+        },
+        {
+          "id": "openrouter_runtime_inference",
+          "evidence_kind": "external"
+        },
+        {
+          "id": "llm_budget_enforcement",
+          "evidence_kind": "local"
+        }
+      ]
+    },
+    {
+      "id": "W05",
+      "title": "Finance agents",
+      "depends_on": [
+        "W03",
+        "W04"
+      ],
+      "target_paths": [
+        "aegis/agents/",
+        "aegis/jobs/"
+      ],
+      "required_evidence": [
+        "role/tool/evidence evaluation",
+        "3-arm research comparison"
+      ],
+      "status": "NOT_STARTED",
+      "note": "Paths are implementation targets, not claimed present or working.",
+      "gates": [
+        {
+          "id": "agent_evaluation",
+          "evidence_kind": "local"
+        },
+        {
+          "id": "credentialed_agent_workflow",
+          "evidence_kind": "external"
+        }
+      ]
+    },
+    {
+      "id": "W06",
+      "title": "Official Kronos reproduction",
+      "depends_on": [
+        "W01",
+        "W02"
+      ],
+      "target_paths": [
+        "aegis/kronos_adapter.py",
+        "scripts/install_kronos.py",
+        "scripts/kronos_smoke.py"
+      ],
+      "required_evidence": [
+        "real artifact hashes",
+        "real inference",
+        "matched-upstream parity",
+        "forward calendar tests"
+      ],
+      "status": "NOT_STARTED",
+      "note": "Paths are implementation targets, not claimed present or working.",
+      "gates": [
+        {
+          "id": "kronos_real_smoke",
+          "evidence_kind": "real_model"
+        },
+        {
+          "id": "kronos_upstream_parity",
+          "evidence_kind": "real_model"
+        }
+      ]
+    },
+    {
+      "id": "W07",
+      "title": "Quantitative and portfolio engines",
+      "depends_on": [
+        "W02",
+        "W06"
+      ],
+      "target_paths": [
+        "aegis/quant.py",
+        "aegis/research.py",
+        "aegis/engine.py"
+      ],
+      "required_evidence": [
+        "frozen holdouts",
+        "cost/availability negative controls",
+        "numerical oracles"
+      ],
+      "status": "NOT_STARTED",
+      "note": "Paths are implementation targets, not claimed present or working.",
+      "gates": [
+        {
+          "id": "chronological_quant_evaluation",
+          "evidence_kind": "local"
+        }
+      ]
+    },
+    {
+      "id": "W08",
+      "title": "Risk and external paper OMS",
+      "depends_on": [
+        "W01",
+        "W02"
+      ],
+      "target_paths": [
+        "aegis/risk/",
+        "aegis/brokers/",
+        "aegis/engine.py",
+        "aegis/store.py"
+      ],
+      "required_evidence": [
+        "credentialed paper lifecycle",
+        "1000 prohibition/fault cases",
+        "restart reconciliation"
+      ],
+      "status": "NOT_STARTED",
+      "note": "Paths are implementation targets, not claimed present or working.",
+      "gates": [
+        {
+          "id": "risk_fault_suite",
+          "evidence_kind": "local"
+        },
+        {
+          "id": "external_paper_lifecycle",
+          "evidence_kind": "external"
+        }
+      ]
+    },
+    {
+      "id": "W09",
+      "title": "Premium connected UI",
+      "depends_on": [
+        "W02",
+        "W03",
+        "W04",
+        "W05",
+        "W06",
+        "W07",
+        "W08"
+      ],
+      "target_paths": [
+        "web/",
+        "aegis/api.py",
+        "scripts/browser_smoke.py"
+      ],
+      "required_evidence": [
+        "native browser suite",
+        "responsive screenshots",
+        "all action/state wiring"
+      ],
+      "status": "NOT_STARTED",
+      "note": "Paths are implementation targets, not claimed present or working.",
+      "gates": [
+        {
+          "id": "native_browser",
+          "evidence_kind": "native_browser"
+        }
+      ]
+    },
+    {
+      "id": "W10",
+      "title": "Deployment and operations",
+      "depends_on": [
+        "W01",
+        "W08"
+      ],
+      "target_paths": [
+        "aegis/persistence/",
+        "compose.yaml",
+        "Dockerfile",
+        ".github/workflows/"
+      ],
+      "required_evidence": [
+        "migrations and restore",
+        "CI",
+        "least-privilege container",
+        "OIDC if network exposed"
+      ],
+      "status": "NOT_STARTED",
+      "note": "Paths are implementation targets, not claimed present or working.",
+      "gates": [
+        {
+          "id": "deployment_smoke",
+          "evidence_kind": "local"
+        },
+        {
+          "id": "backup_restore",
+          "evidence_kind": "local"
+        }
+      ]
+    },
+    {
+      "id": "W11",
+      "title": "Final qualification",
+      "depends_on": [
+        "W05",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10"
+      ],
+      "target_paths": [
+        "evidence/",
+        "docs/"
+      ],
+      "required_evidence": [
+        "two real market sessions",
+        "24h process window",
+        "readiness matrix",
+        "release manifest"
+      ],
+      "status": "NOT_STARTED",
+      "note": "Paths are implementation targets, not claimed present or working.",
+      "gates": [
+        {
+          "id": "paper_soak",
+          "evidence_kind": "external"
+        },
+        {
+          "id": "final_regression",
+          "evidence_kind": "local"
+        }
+      ]
+    }
+  ]
+}

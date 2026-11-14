@@ -1,0 +1,234 @@
+{
+  "recorded_at": "2026-11-14T18:26:26.275393+00:00",
+  "audited_baseline": "b0ec80cbea1e2a78155525fed2b13542d523e9e7",
+  "head_commit": "b0ec80cbea1e2a78155525fed2b13542d523e9e7",
+  "branch": "feat/autonomous-completion",
+  "environment": {
+    "os": "Linux-6.8.0-138-generic-x86_64-with-glibc2.35",
+    "python": "3.10.12",
+    "gpu": "NVIDIA GeForce RTX 4080 SUPER",
+    "free_disk_bytes": 63627116544
+  },
+  "api_routes": [
+    {
+      "path": "/",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/alerts",
+      "methods": [
+        "POST"
+      ]
+    },
+    {
+      "path": "/api/audit",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/audit/export",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/backtests",
+      "methods": [
+        "POST"
+      ]
+    },
+    {
+      "path": "/api/broker/paper-account",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/config",
+      "methods": [
+        "POST"
+      ]
+    },
+    {
+      "path": "/api/correlation",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/data/export",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/data/import",
+      "methods": [
+        "POST"
+      ]
+    },
+    {
+      "path": "/api/filings/{cik}",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/forecasts",
+      "methods": [
+        "POST"
+      ]
+    },
+    {
+      "path": "/api/health",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/integrations",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/login",
+      "methods": [
+        "POST"
+      ]
+    },
+    {
+      "path": "/api/logout",
+      "methods": [
+        "POST"
+      ]
+    },
+    {
+      "path": "/api/market/{symbol}",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/orders",
+      "methods": [
+        "POST"
+      ]
+    },
+    {
+      "path": "/api/orders/{ident}/cancel",
+      "methods": [
+        "POST"
+      ]
+    },
+    {
+      "path": "/api/reconciliation",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/replay/step",
+      "methods": [
+        "POST"
+      ]
+    },
+    {
+      "path": "/api/research/cycle",
+      "methods": [
+        "POST"
+      ]
+    },
+    {
+      "path": "/api/research/results",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/reset",
+      "methods": [
+        "POST"
+      ]
+    },
+    {
+      "path": "/api/risk/halt",
+      "methods": [
+        "POST"
+      ]
+    },
+    {
+      "path": "/api/risk/policy",
+      "methods": [
+        "POST"
+      ]
+    },
+    {
+      "path": "/api/session",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/simulations",
+      "methods": [
+        "POST"
+      ]
+    },
+    {
+      "path": "/api/state",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/stream",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/valuation",
+      "methods": [
+        "POST"
+      ]
+    }
+  ],
+  "ui_views": [
+    "overview",
+    "markets",
+    "research",
+    "kronos",
+    "simulation",
+    "portfolio",
+    "execution",
+    "risk",
+    "evidence",
+    "integrations"
+  ],
+  "baseline_tests": {
+    "pytest": {
+      "passed": 94,
+      "skipped": 1,
+      "skip_reason": "tests/test_kronos_contract.py requires numpy (installed in W06)"
+    },
+    "tests_handoff": {
+      "passed": 37,
+      "failed": 0
+    },
+    "verify_evidence": {
+      "status": "PASS",
+      "events": 148
+    }
+  },
+  "packages": {
+    "fastapi": "0.128.2",
+    "uvicorn": "0.48.0",
+    "httpx": "0.28.1",
+    "pydantic": "2.13.5",
+    "pytest": "9.2.0"
+  }
+}

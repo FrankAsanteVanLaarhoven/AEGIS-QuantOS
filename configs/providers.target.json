@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "data_mode": "live",
+  "execution_mode": "paper_local",
+  "allow_synthetic_fallback": false,
+  "live_money_enabled": false,
+  "initial_symbols": [
+    "NVDA",
+    "AMAT",
+    "LRCX",
+    "TER",
+    "SPY"
+  ],
+  "providers": [
+    {
+      "id": "alpaca_data",
+      "required": true,
+      "feed": "iex",
+      "coverage": "single_exchange",
+      "state": "UNVERIFIED",
+      "credentials": [
+        "ALPACA_API_KEY_FILE",
+        "ALPACA_SECRET_KEY_FILE"
+      ]
+    },
+    {
+      "id": "alpaca_paper",
+      "required": true,
+      "base_url": "https://paper-api.alpaca.markets",
+      "state": "UNVERIFIED",
+      "credentials": [
+        "ALPACA_API_KEY_FILE",
+        "ALPACA_SECRET_KEY_FILE"
+      ]
+    },
+    {
+      "id": "sec",
+      "required": true,
+      "state": "UNVERIFIED",
+      "identity": "SEC_USER_AGENT"
+    },
+    {
+      "id": "licensed_news",
+      "required": true,
+      "state": "UNSELECTED_ENTITLEMENT_REQUIRED"
+    },
+    {
+      "id": "openrouter",
+      "required": true,
+      "state": "UNVERIFIED"
+    },
+    {
+      "id": "kronos",
+      "required": true,
+      "state": "UNVERIFIED"
+    }
+  ],
+  "notes": [
+    "This is a target configuration, not an activation command.",
+    "IEX is not consolidated SIP or NBBO.",
+    "All new settings must first be implemented and tested in the actual runtime."
+  ]
+}

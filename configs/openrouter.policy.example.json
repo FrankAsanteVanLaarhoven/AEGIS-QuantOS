@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "enabled": false,
+  "base_url": "https://openrouter.ai/api/v1",
+  "runtime_key_env": "OPENROUTER_API_KEY",
+  "runtime_key_file_env": "OPENROUTER_API_KEY_FILE",
+  "paid_calls_authorized": false,
+  "daily_budget_usd": null,
+  "job_budget_usd": null,
+  "project_budget_usd": null,
+  "timeout_seconds": 30,
+  "max_parallel_calls": 2,
+  "max_job_steps": 6,
+  "max_retries": 2,
+  "unknown_outcome_retry": false,
+  "provider": {
+    "require_parameters": true,
+    "data_collection": "deny",
+    "zdr": true,
+    "allow_fallbacks": false
+  },
+  "roles": {
+    "filing_extractor": {
+      "model_id": null,
+      "approved_fallbacks": [],
+      "evaluation_gate": "REQUIRED",
+      "maximum_output_tokens": 2048
+    },
+    "market_researcher": {
+      "model_id": null,
+      "approved_fallbacks": [],
+      "evaluation_gate": "REQUIRED",
+      "maximum_output_tokens": 2048
+    },
+    "hypothesis_author": {
+      "model_id": null,
+      "approved_fallbacks": [],
+      "evaluation_gate": "REQUIRED",
+      "maximum_output_tokens": 2048
+    },
+    "evidence_checker": {
+      "model_id": null,
+      "approved_fallbacks": [],
+      "evaluation_gate": "REQUIRED",
+      "maximum_output_tokens": 2048
+    },
+    "report_explainer": {
+      "model_id": null,
+      "approved_fallbacks": [],
+      "evaluation_gate": "REQUIRED",
+      "maximum_output_tokens": 2048
+    }
+  },
+  "forbidden_tools": [
+    "broker_submit",
+    "change_risk_policy",
+    "read_secret",
+    "arbitrary_shell"
+  ],
+  "readiness": "CONFIGURATION_TEMPLATE_ONLY"
+}

@@ -1,0 +1,47 @@
+[
+  {
+    "check": "installer_dry_run",
+    "pass": true,
+    "details": {
+      "state": "DRY_RUN",
+      "new_files": 15,
+      "identical_files": 0,
+      "source_code_overwritten": false,
+      "secrets_created": false,
+      "next": "Open the repository in Antigravity and invoke /aegis-complete with ANTIGRAVITY_MASTER_PROMPT.md"
+    }
+  },
+  {
+    "check": "installer_applies_new_files",
+    "pass": true,
+    "details": {
+      "state": "INSTALLED",
+      "new_files": 15,
+      "identical_files": 0,
+      "source_code_overwritten": false,
+      "secrets_created": false,
+      "next": "Open the repository in Antigravity and invoke /aegis-complete with ANTIGRAVITY_MASTER_PROMPT.md"
+    }
+  },
+  {
+    "check": "installer_idempotent",
+    "pass": true
+  },
+  {
+    "check": "existing_application_unchanged",
+    "pass": true
+  },
+  {
+    "check": "preflight_on_local_fixture_clone",
+    "pass": true,
+    "note": "Local fixture commit differs from real audited GitHub SHA; no remote change."
+  },
+  {
+    "check": "missing_gate_evidence_blocks_completion",
+    "pass": true
+  },
+  {
+    "check": "installer_preserves_conflicting_file",
+    "pass": true
+  }
+]
