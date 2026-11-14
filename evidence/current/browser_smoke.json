@@ -1,0 +1,29 @@
+{
+  "checks": [
+    "Authenticated workspace renders via native login/cookies/CSRF",
+    "View renders: markets",
+    "View renders: research",
+    "View renders: kronos",
+    "View renders: simulation",
+    "View renders: portfolio",
+    "View renders: execution",
+    "View renders: risk",
+    "View renders: evidence",
+    "View renders: integrations",
+    "View renders: overview",
+    "Paper order queued and filled through native UI",
+    "Halt and resume through UI",
+    "Bootstrap experiment renders computed envelope",
+    "Backtest, DCF, and bounded research agent job render",
+    "Real pretrained Kronos forecast chart renders",
+    "Integrations provider qualification matrix renders",
+    "Keyboard-command navigation works",
+    "820px tablet layout: no page overflow",
+    "430px mobile layout: no page overflow"
+  ],
+  "passed": 20,
+  "page_errors": [],
+  "browser": "Chromium / Playwright",
+  "transport": "Native browser HTTP",
+  "screenshots": "evidence/current/screenshots/ui_*.png"
+}
