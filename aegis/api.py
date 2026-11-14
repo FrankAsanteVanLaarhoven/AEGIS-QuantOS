@@ -21,6 +21,9 @@ from .settings import build_runtime_context
 from .doctor import run_doctor
 from .market.supervisor import MarketDataSupervisor
 from .providers.alpaca_market import AlpacaMarketAdapter
+from .providers.evidence import EvidenceStore
+from .providers.sec import SecEdgarAdapter
+from .providers.registry import provider_registry
 
 ROOT=Path(__file__).resolve().parents[1]
 class Model(BaseModel): model_config=ConfigDict(extra='forbid',allow_inf_nan=False)
@@ -71,7 +74,9 @@ def create_app(db_path=None,token=None):
     if not (resolver.resolve('ALPACA_API_KEY') and resolver.resolve('ALPACA_SECRET_KEY')) and settings.data_mode in ('live','delayed'):
         supervisor.mark_blocked_credential('Alpaca market-data credentials missing')
     alpaca_market=AlpacaMarketAdapter(settings,resolver,supervisor)
-    app.state.service=service; app.state.token=auth_token; app.state.settings=settings; app.state.secrets=resolver; app.state.market_supervisor=supervisor
+    evidence_store=EvidenceStore()
+    sec_adapter=SecEdgarAdapter(settings)
+    app.state.service=service; app.state.token=auth_token; app.state.settings=settings; app.state.secrets=resolver; app.state.market_supervisor=supervisor; app.state.evidence_store=evidence_store
     app.add_middleware(TrustedHostMiddleware,allowed_hosts=['localhost','127.0.0.1','testserver','[::1]'])
     @app.middleware('http')
     async def boundary(request:Request,call_next):
@@ -196,6 +201,20 @@ def create_app(db_path=None,token=None):
         result=sec_filings(cik)
         with service.store.tx(): result=service.store.result('filings',result); service.store.append('research.filings_imported',{'id':result['id'],'hash':result['response_sha256']})
         return result
+    @app.get('/api/sec/facts/{cik}')
+    def sec_facts(cik:str):
+        summary,doc=sec_adapter.fetch_company_facts(cik)
+        evidence_store.add(doc)
+        return {'summary':summary,'document':doc.model_dump(mode='json')}
+    @app.get('/api/evidence/documents')
+    def evidence_documents(symbol:str|None=None,as_of:str|None=None):
+        if as_of:
+            from datetime import datetime
+            cutoff=datetime.fromisoformat(as_of.replace('Z','+00:00'))
+            docs=evidence_store.as_of(cutoff,symbol=symbol)
+        else:
+            docs=[d for d in evidence_store.all_documents() if not symbol or d.entity_symbol==symbol.upper()]
+        return {'count':len(docs),'documents':[d.model_dump(mode='json') for d in docs],'registry':provider_registry(settings,resolver)}
     @app.get('/api/broker/paper-account')
     def broker():return alpaca_read()
     @app.get('/api/audit')
