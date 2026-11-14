@@ -1,0 +1,59 @@
+{
+  "generated_at": "2026-11-14T18:52:01.385656+00:00",
+  "repository": "FrankAsanteVanLaarhoven/AEGIS-QuantOS",
+  "branch": "feat/autonomous-completion",
+  "release_status": "PARTIAL_EXTERNAL_BLOCKERS",
+  "real_money_execution": false,
+  "cost_usd": 0.0,
+  "work_packages": {
+    "W00": {
+      "status": "VERIFIED_LOCAL",
+      "note": "Baseline audited & 94->165 tests"
+    },
+    "W01": {
+      "status": "VERIFIED_LOCAL",
+      "note": "Typed settings, SecretResolver, doctor, API redaction"
+    },
+    "W02": {
+      "status": "BLOCKED_CREDENTIAL",
+      "note": "Supervisor/calendar/bars/Alpaca adapter verified locally; live stream needs ALPACA_API_KEY/SECRET"
+    },
+    "W03": {
+      "status": "BLOCKED_CREDENTIAL",
+      "note": "Bitemporal SourceDocument/SEC/sanitization verified locally; SEC_USER_AGENT & NEWS_API_KEY unset"
+    },
+    "W04": {
+      "status": "BLOCKED_CREDENTIAL",
+      "note": "OpenRouter gateway/schemas/budget verified locally; OPENROUTER_API_KEY unset"
+    },
+    "W05": {
+      "status": "BLOCKED_CREDENTIAL",
+      "note": "5 finance roles/coordinator/3-arm eval verified locally; live LLM workflow blocked on OpenRouter key"
+    },
+    "W06": {
+      "status": "VERIFIED_LOCAL",
+      "note": "Real NeoQuasar/Kronos-mini downloaded, SHA-256 verified, smoke & direct-upstream parity passed"
+    },
+    "W07": {
+      "status": "VERIFIED_LOCAL",
+      "note": "Purged splits, cost sensitivity, BH FDR, DCF oracle, no-trade negative control passed"
+    },
+    "W08": {
+      "status": "BLOCKED_CREDENTIAL",
+      "note": "1,050-case risk fault suite & OMS timeout/reconcile passed locally; live paper broker needs Alpaca keys"
+    },
+    "W09": {
+      "status": "VERIFIED_LOCAL",
+      "note": "20 native Playwright Chromium checks passed with 0 page errors across desktop/tablet/mobile"
+    },
+    "W10": {
+      "status": "VERIFIED_LOCAL",
+      "note": "WAL backup/restore, migrations, non-root Dockerfile & CI passed"
+    },
+    "W11": {
+      "status": "BLOCKED_CREDENTIAL",
+      "note": "165/165 local+real_model+native_browser tests passed; 2-session paper soak blocked on Alpaca keys & weekend market"
+    }
+  },
+  "secret_scan": "CLEAN_ZERO_EXPOSURES"
+}
