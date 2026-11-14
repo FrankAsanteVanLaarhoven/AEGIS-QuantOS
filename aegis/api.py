@@ -28,7 +28,7 @@ from .providers.registry import provider_registry
 from .llm.gateway import OpenRouterGateway
 from .jobs.queue import DurableJobManager
 from .agents.coordinator import ResearchCoordinator
-from .risk.policy import DEFAULT_PROFILES
+from .risk.policy import DEFAULT_PROFILES, IndependentRiskGate, OrderIntent
 from .brokers.alpaca_paper import AlpacaPaperOMS
 
 ROOT=Path(__file__).resolve().parents[1]
@@ -86,8 +86,9 @@ def create_app(db_path=None,token=None):
     llm_gateway=OpenRouterGateway(settings,resolver)
     job_manager=DurableJobManager()
     coordinator=ResearchCoordinator(evidence_store,llm_gateway)
-    paper_oms=AlpacaPaperOMS(settings,resolver)
-    app.state.service=service; app.state.token=auth_token; app.state.settings=settings; app.state.secrets=resolver; app.state.market_supervisor=supervisor; app.state.evidence_store=evidence_store; app.state.llm_gateway=llm_gateway; app.state.job_manager=job_manager; app.state.paper_oms=paper_oms
+    risk_gate=IndependentRiskGate(store=service.store)
+    paper_oms=AlpacaPaperOMS(settings,resolver,store=service.store,risk_gate=risk_gate)
+    app.state.service=service; app.state.token=auth_token; app.state.settings=settings; app.state.secrets=resolver; app.state.market_supervisor=supervisor; app.state.evidence_store=evidence_store; app.state.llm_gateway=llm_gateway; app.state.job_manager=job_manager; app.state.paper_oms=paper_oms; app.state.risk_gate=risk_gate
     app.add_middleware(TrustedHostMiddleware,allowed_hosts=['localhost','127.0.0.1','testserver','[::1]'])
     @app.middleware('http')
     async def boundary(request:Request,call_next):
@@ -143,7 +144,21 @@ def create_app(db_path=None,token=None):
             if symbol not in service.dataset.symbols: raise ValueError('Unknown symbol')
             return {'symbol':symbol,'source':service.dataset.source,'bars':service.dataset.prefix(symbol,s['index'])[-240:],'asof':service.dataset.time(s['index'])}
     @app.post('/api/orders')
-    def order(body:Order):return service.submit(**body.model_dump())
+    def order(body:Order):
+        if settings.execution_mode=='paper_external':
+            from datetime import datetime,timedelta,timezone
+            snap=service.snapshot()
+            marks={sym:float(q['close']) for sym,q in snap.get('quotes',{}).items() if 'close' in q}
+            price=marks.get(body.symbol.upper())
+            if not price: raise ValueError('Unknown symbol or missing mark')
+            positions={sym:float(pos.get('qty',0.0)) for sym,pos in snap.get('positions',{}).items()}
+            acct=snap.get('account',{})
+            now=datetime.now(timezone.utc)
+            intent=OrderIntent(environment='paper_external',symbol=body.symbol.upper(),side=body.side,qty=float(body.qty),client_order_id=body.client_id,expires_at=now+timedelta(minutes=5),data_age_seconds=float(supervisor.snapshot().get('data_age_seconds') or 0.0))
+            decision=risk_gate.evaluate(intent,price=price,equity=float(acct.get('equity',0.0)),cash=float(acct.get('cash',0.0)),positions=positions,marks=marks,halted=bool(snap.get('halted',False)),integrity_ok=bool(snap.get('integrity_ok',True)),now=now)
+            if not decision.approved: raise ValueError('RISK_REJECTED: '+','.join(decision.reasons))
+            return {'mode':'paper_external','decision':decision.model_dump(mode='json'),'order':paper_oms.submit_order(intent,decision).model_dump(mode='json')}
+        return service.submit(**body.model_dump())
     @app.post('/api/orders/{ident}/cancel')
     def cancel(ident:str):return service.cancel(ident)
     @app.post('/api/replay/step')
@@ -256,6 +271,10 @@ def create_app(db_path=None,token=None):
     def risk_profiles():return {k:v.model_dump(mode='json') for k,v in DEFAULT_PROFILES.items()}
     @app.get('/api/broker/paper-orders')
     def paper_orders():return {'execution_mode':settings.execution_mode,'live_money_enabled':False,'outbox':paper_oms.outbox_snapshot()}
+    @app.post('/api/broker/paper-orders/{client_order_id}/reconcile')
+    def reconcile_paper_order(client_order_id:str):return paper_oms.reconcile_by_client_id(client_order_id).model_dump(mode='json')
+    @app.post('/api/broker/paper-orders/{client_order_id}/cancel')
+    def cancel_paper_order(client_order_id:str):return paper_oms.cancel_order(client_order_id).model_dump(mode='json')
     @app.get('/api/broker/paper-account')
     def broker():return alpaca_read()
     @app.get('/api/audit')
