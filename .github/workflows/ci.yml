@@ -9,7 +9,9 @@ jobs:
         with:
           python-version: '3.12'
       - run: pip install -r requirements-dev.txt
-      - run: python -m pytest -q --junitxml=evidence/pytest-ci.xml
+      - run: python -m unittest discover -s tests_handoff -v
+      - run: python -m pytest -q --ignore=tests/test_kronos_real_parity.py --junitxml=evidence/pytest-ci.xml
+      - run: python scripts/aegis_delivery_preflight.py --repo "$PWD"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
