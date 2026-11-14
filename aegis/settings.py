@@ -156,3 +156,4 @@ def build_runtime_context(env: Mapping[str, str] | None = None) -> tuple[AegisSe
     settings = AegisSettings.from_env(env)
     resolver = SecretResolver(env)
     return settings, resolver
+

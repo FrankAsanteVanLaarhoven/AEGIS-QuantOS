@@ -19,6 +19,8 @@ from . import kronos_adapter as kronos
 from .connectors import connector_status, sec_filings, alpaca_read
 from .settings import build_runtime_context
 from .doctor import run_doctor
+from .market.supervisor import MarketDataSupervisor
+from .providers.alpaca_market import AlpacaMarketAdapter
 
 ROOT=Path(__file__).resolve().parents[1]
 class Model(BaseModel): model_config=ConfigDict(extra='forbid',allow_inf_nan=False)
@@ -65,7 +67,11 @@ def create_app(db_path=None,token=None):
         try: await task
         except asyncio.CancelledError: pass
     app=FastAPI(title='AEGIS QuantOS',version='0.2.0',lifespan=lifespan,docs_url=None,redoc_url=None,openapi_url=None)
-    app.state.service=service; app.state.token=auth_token; app.state.settings=settings; app.state.secrets=resolver
+    supervisor=MarketDataSupervisor(feed=settings.alpaca_data_feed,source_mode=settings.data_mode,allow_synthetic_fallback=settings.allow_synthetic_fallback)
+    if not (resolver.resolve('ALPACA_API_KEY') and resolver.resolve('ALPACA_SECRET_KEY')) and settings.data_mode in ('live','delayed'):
+        supervisor.mark_blocked_credential('Alpaca market-data credentials missing')
+    alpaca_market=AlpacaMarketAdapter(settings,resolver,supervisor)
+    app.state.service=service; app.state.token=auth_token; app.state.settings=settings; app.state.secrets=resolver; app.state.market_supervisor=supervisor
     app.add_middleware(TrustedHostMiddleware,allowed_hosts=['localhost','127.0.0.1','testserver','[::1]'])
     @app.middleware('http')
     async def boundary(request:Request,call_next):
@@ -112,6 +118,8 @@ def create_app(db_path=None,token=None):
         sessions.pop(request.cookies.get('aegis_session'),None); r=JSONResponse({'ok':True}); r.delete_cookie('aegis_session'); return r
     @app.get('/api/state')
     def state():return service.snapshot()
+    @app.get('/api/market/feed/status')
+    def market_feed_status():return supervisor.status()
     @app.get('/api/market/{symbol}')
     def market(symbol:str):
         with service.store.lock:

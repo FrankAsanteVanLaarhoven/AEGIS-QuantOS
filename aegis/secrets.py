@@ -148,3 +148,4 @@ class SecretResolver:
         redacted = re.sub(r'sk-or-(?:v1|mgmt)-[A-Za-z0-9_-]{8,}', '[REDACTED_OPENROUTER_KEY]', redacted)
         redacted = re.sub(r'Bearer\s+[A-Za-z0-9._-]{8,}', 'Bearer [REDACTED]', redacted)
         return redacted
+

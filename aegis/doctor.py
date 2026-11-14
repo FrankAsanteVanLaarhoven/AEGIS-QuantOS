@@ -80,3 +80,4 @@ def run_doctor(
         'offline_capable': True,
         'live_money_enabled': False,
     }
+

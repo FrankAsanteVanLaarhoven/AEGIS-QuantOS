@@ -106,3 +106,4 @@ def test_doctor_and_api_never_leak_secrets(tmp_path: Path, monkeypatch):
     r_res = client.get('/api/ready')
     assert r_res.status_code == 200
     assert r_res.json()['live_execution'] is False
+
