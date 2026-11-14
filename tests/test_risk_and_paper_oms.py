@@ -128,3 +128,69 @@ def test_external_paper_oms_timeout_reconcile_and_idempotency():
     assert rec_final.state == 'FILLED'
     assert rec_final.filled_qty == 5.0
     assert rec_final.filled_avg_price == 100.5
+
+
+def test_c1_finite_validation_marks_and_pending_reservations(tmp_path):
+    from aegis.store import Store
+
+    store = Store(tmp_path / 'risk.sqlite')
+    gate = IndependentRiskGate(store=store)
+    now = datetime(2026, 11, 14, 15, 0, tzinfo=timezone.utc)
+
+    # 1. NaN / Inf price, equity, cash rejected
+    for bad_kw in [
+        {'price': float('nan'), 'equity': 1000.0, 'cash': 1000.0},
+        {'price': 10.0, 'equity': float('inf'), 'cash': 1000.0},
+        {'price': 10.0, 'equity': 1000.0, 'cash': float('nan')},
+    ]:
+        it = OrderIntent(
+            symbol='AAA', side='BUY', qty=1, client_order_id='bad_' + str(bad_kw),
+            expires_at=now + timedelta(minutes=5), data_age_seconds=0.0,
+        )
+        assert not gate.evaluate(it, positions={}, now=now, **bad_kw).approved
+
+    # 2. Missing per-instrument mark fails closed; valid marks below gross cap pass
+    other_it = OrderIntent(
+        symbol='AAA', side='BUY', qty=1, client_order_id='marks_1',
+        expires_at=now + timedelta(minutes=5), data_age_seconds=0.0,
+    )
+    dec_missing = gate.evaluate(other_it, price=1.0, equity=10000.0, cash=1000.0, positions={'BBB': 10.0}, now=now)
+    assert not dec_missing.approved
+    assert 'MISSING_POSITION_MARKS' in dec_missing.reasons
+
+    dec_ok = gate.evaluate(
+        other_it, price=1.0, equity=10000.0, cash=1000.0,
+        positions={'BBB': 10.0}, marks={'BBB': 100.0}, now=now,
+    )
+    assert dec_ok.approved
+
+    # 3. Pending BUY cash reservation persists across gate restart
+    gate_restarted = IndependentRiskGate(store=store)
+    buy2 = OrderIntent(
+        symbol='CCC', side='BUY', qty=100, client_order_id='buy_2',
+        expires_at=now + timedelta(minutes=5), data_age_seconds=0.0,
+    )
+    # 100 * 10 = 1000 > available cash (1000 - 1 = 999)
+    dec_cash = gate_restarted.evaluate(
+        buy2, price=10.0, equity=10000.0, cash=1000.0,
+        positions={'BBB': 10.0}, marks={'BBB': 100.0}, now=now,
+    )
+    assert not dec_cash.approved
+    assert 'INSUFFICIENT_CASH' in dec_cash.reasons
+
+    # 4. Pending SELL reservations prevent overselling across two orders and survive restart
+    sell1 = OrderIntent(
+        symbol='BBB', side='SELL', qty=7, client_order_id='sell_1',
+        expires_at=now + timedelta(minutes=5), data_age_seconds=0.0,
+    )
+    sell2 = OrderIntent(
+        symbol='BBB', side='SELL', qty=7, client_order_id='sell_2',
+        expires_at=now + timedelta(minutes=5), data_age_seconds=0.0,
+    )
+    assert gate_restarted.evaluate(sell1, price=100.0, equity=10000.0, cash=1000.0, positions={'BBB': 10.0}, now=now).approved
+    gate_restarted2 = IndependentRiskGate(store=store)
+    dec_sell2 = gate_restarted2.evaluate(sell2, price=100.0, equity=10000.0, cash=1000.0, positions={'BBB': 10.0}, now=now)
+    assert not dec_sell2.approved
+    assert 'SHORT_SELLING_PROHIBITED' in dec_sell2.reasons
+
+

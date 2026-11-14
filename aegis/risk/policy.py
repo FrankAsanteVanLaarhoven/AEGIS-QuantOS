@@ -2,11 +2,32 @@
 from __future__ import annotations
 
 import hashlib
-import json
+import math
 import threading
 from datetime import datetime, timezone
 from typing import Any, Literal
-from pydantic import BaseModel, ConfigDict, Field
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+def _is_finite_positive(value: float | int | None) -> bool:
+    if value is None or isinstance(value, bool):
+        return False
+    f = float(value)
+    return math.isfinite(f) and f > 0.0
+
+
+def _is_finite_non_negative(value: float | int | None) -> bool:
+    if value is None or isinstance(value, bool):
+        return False
+    f = float(value)
+    return math.isfinite(f) and f >= 0.0
+
+
+def _is_finite(value: float | int | None) -> bool:
+    if value is None or isinstance(value, bool):
+        return False
+    return math.isfinite(float(value))
 
 
 class OrderIntent(BaseModel):
@@ -26,6 +47,13 @@ class OrderIntent(BaseModel):
     expires_at: datetime
     data_age_seconds: float = Field(ge=0.0)
     policy_version: str = 'quantshield_native_v1'
+
+    @field_validator('qty', 'limit_price', 'data_age_seconds')
+    @classmethod
+    def _require_finite_float(cls, value: float | None) -> float | None:
+        if value is not None and not math.isfinite(float(value)):
+            raise ValueError('Numeric order field must be finite')
+        return value
 
     def intent_hash(self) -> str:
         return hashlib.sha256(self.model_dump_json().encode('utf-8')).hexdigest()
@@ -78,12 +106,66 @@ class RiskDecision(BaseModel):
 
 
 class IndependentRiskGate:
-    """Thread-safe risk evaluator with atomic cross-symbol exposure reservations."""
+    """Thread-safe risk evaluator with atomic BUY notional and SELL quantity reservations."""
 
-    def __init__(self, profile: RiskProfile | None = None) -> None:
+    _STORE_KEY = 'risk_gate_reservations_v1'
+
+    def __init__(self, profile: RiskProfile | None = None, store: Any = None) -> None:
         self.profile = profile or DEFAULT_PROFILES['generic_paper_v1']
-        self._lock = threading.Lock()
-        self._reserved_notional: dict[str, float] = {}
+        self._store = store
+        self._lock = threading.RLock()
+        # Keyed by f"{account_id}:{environment}:{client_order_id}"
+        self._buy_reservations: dict[str, dict[str, Any]] = {}
+        self._sell_reservations: dict[str, dict[str, Any]] = {}
+        self._legacy_symbol_notional: dict[str, float] = {}
+        self._load_from_store()
+
+    @staticmethod
+    def _order_key(account_id: str, environment: str, client_order_id: str) -> str:
+        return f'{account_id}:{environment}:{client_order_id}'
+
+    def _load_from_store(self) -> None:
+        if self._store is None:
+            return
+        raw = self._store.get(self._STORE_KEY)
+        if not isinstance(raw, dict):
+            return
+        self._buy_reservations = dict(raw.get('buy', {}))
+        self._sell_reservations = dict(raw.get('sell', {}))
+        self._legacy_symbol_notional = dict(raw.get('legacy', {}))
+
+    def _persist_to_store(self) -> None:
+        if self._store is None:
+            return
+        self._store.put(
+            self._STORE_KEY,
+            {
+                'buy': self._buy_reservations,
+                'sell': self._sell_reservations,
+                'legacy': self._legacy_symbol_notional,
+            },
+        )
+
+    def _reserved_buy_notional_by_symbol(self, account_id: str, environment: str, symbol: str) -> float:
+        total = self._legacy_symbol_notional.get(symbol, 0.0)
+        for rec in self._buy_reservations.values():
+            if rec['account_id'] == account_id and rec['environment'] == environment and rec['symbol'] == symbol:
+                total += float(rec['notional'])
+        return total
+
+    def _reserved_buy_total(self, account_id: str, environment: str) -> float:
+        total = sum(self._legacy_symbol_notional.values())
+        for rec in self._buy_reservations.values():
+            if rec['account_id'] == account_id and rec['environment'] == environment:
+                total += float(rec['notional'])
+        return total
+
+    def _reserved_sell_qty(self, account_id: str, environment: str, symbol: str) -> float:
+        total = 0.0
+        for rec in self._sell_reservations.values():
+            if rec['account_id'] == account_id and rec['environment'] == environment and rec['symbol'] == symbol:
+                total += float(rec['qty'])
+        return total
 
     def evaluate(
         self,
@@ -93,6 +175,7 @@ class IndependentRiskGate:
         equity: float,
         cash: float,
         positions: dict[str, float],
+        marks: dict[str, float] | None = None,
         daily_pnl_pct: float = 0.0,
         total_drawdown_pct: float = 0.0,
         halted: bool = False,
@@ -102,12 +185,46 @@ class IndependentRiskGate:
     ) -> RiskDecision:
         now_utc = now or datetime.now(timezone.utc)
         sym = intent.symbol.upper()
-        held_qty = float(positions.get(sym, 0.0))
-        is_risk_reducing = intent.side == 'SELL' and held_qty >= intent.qty
+        i_hash = intent.intent_hash()
+        order_key = self._order_key(intent.account_id, intent.environment, intent.client_order_id)
         checks: list[str] = []
         reasons: list[str] = []
 
         with self._lock:
+            self._load_from_store()
+
+            existing = self._buy_reservations.get(order_key) or self._sell_reservations.get(order_key)
+            if existing is not None:
+                if existing.get('intent_hash') == i_hash:
+                    return RiskDecision(
+                        approved=True,
+                        intent_hash=i_hash,
+                        account_revision=account_revision,
+                        checks=['idempotent_reservation'],
+                        reasons=[],
+                        risk_reducing=bool(existing.get('risk_reducing', False)),
+                        policy_version=self.profile.profile_id,
+                    )
+                return RiskDecision(
+                    approved=False,
+                    intent_hash=i_hash,
+                    account_revision=account_revision,
+                    checks=['idempotency'],
+                    reasons=['DUPLICATE_CLIENT_ORDER_ID'],
+                    risk_reducing=False,
+                    policy_version=self.profile.profile_id,
+                )
+
+            held_raw = positions.get(sym, positions.get(intent.symbol, 0.0))
+            held_qty = float(held_raw) if _is_finite(held_raw) else math.nan
+            reserved_sell = self._reserved_sell_qty(intent.account_id, intent.environment, sym)
+            available_sell_qty = held_qty - reserved_sell if math.isfinite(held_qty) else math.nan
+            is_risk_reducing = (
+                intent.side == 'SELL'
+                and math.isfinite(available_sell_qty)
+                and available_sell_qty >= intent.qty - 1e-9
+            )
+
             if intent.expires_at.astimezone(timezone.utc) <= now_utc.astimezone(timezone.utc):
                 reasons.append('INTENT_EXPIRED')
             checks.append('expiry')
@@ -120,46 +237,124 @@ class IndependentRiskGate:
                 reasons.append('EMERGENCY_HALT_ACTIVE')
             checks.append('halt')
 
-            if intent.data_age_seconds > self.profile.max_data_age_seconds and not is_risk_reducing:
+            if not _is_finite_non_negative(intent.data_age_seconds):
+                reasons.append('INVALID_VALUATION')
+            elif intent.data_age_seconds > self.profile.max_data_age_seconds and not is_risk_reducing:
                 reasons.append('STALE_MARKET_DATA')
             checks.append('data_freshness')
 
-            if price <= 0 or equity <= 0:
+            valuation_ok = (
+                _is_finite_positive(price)
+                and _is_finite_positive(equity)
+                and _is_finite_non_negative(cash)
+                and _is_finite_positive(intent.qty)
+                and _is_finite(daily_pnl_pct)
+                and _is_finite(total_drawdown_pct)
+                and math.isfinite(held_qty)
+            )
+            if not valuation_ok:
                 reasons.append('INVALID_VALUATION')
             checks.append('valuation')
 
-            if intent.side == 'SELL' and self.profile.no_short_selling and intent.qty > held_qty + 1e-9:
-                reasons.append('SHORT_SELLING_PROHIBITED')
+            if intent.side == 'SELL' and self.profile.no_short_selling:
+                if not math.isfinite(available_sell_qty) or intent.qty > available_sell_qty + 1e-9:
+                    reasons.append('SHORT_SELLING_PROHIBITED')
             checks.append('no_short_selling')
 
             if not is_risk_reducing:
-                if daily_pnl_pct <= -self.profile.max_daily_loss_pct:
+                if _is_finite(daily_pnl_pct) and daily_pnl_pct <= -self.profile.max_daily_loss_pct:
                     reasons.append('MAX_DAILY_LOSS_BREACHED')
-                if total_drawdown_pct >= self.profile.max_total_loss_pct:
+                if _is_finite(total_drawdown_pct) and total_drawdown_pct >= self.profile.max_total_loss_pct:
                     reasons.append('MAX_TOTAL_DRAWDOWN_BREACHED')
                 checks.append('loss_limits')
 
-                notional = intent.qty * price
-                if notional > cash + 1e-9:
-                    reasons.append('INSUFFICIENT_CASH')
-                if equity > 0 and (notional / equity) > self.profile.max_order_notional_pct + 1e-9:
-                    reasons.append('ORDER_NOTIONAL_LIMIT')
+                if valuation_ok:
+                    notional = float(intent.qty) * float(price)
+                    reserved_cash = self._reserved_buy_total(intent.account_id, intent.environment)
+                    if notional > (float(cash) - reserved_cash) + 1e-9:
+                        reasons.append('INSUFFICIENT_CASH')
+                    if (notional / float(equity)) > self.profile.max_order_notional_pct + 1e-9:
+                        reasons.append('ORDER_NOTIONAL_LIMIT')
 
-                current_sym_notional = held_qty * price + self._reserved_notional.get(sym, 0.0)
-                if equity > 0 and ((current_sym_notional + notional) / equity) > self.profile.max_concentration_pct + 1e-9:
-                    reasons.append('CONCENTRATION_LIMIT')
+                    sym_mark = float(price)
+                    if marks is not None:
+                        m_val = marks.get(sym, marks.get(intent.symbol))
+                        if m_val is not None:
+                            if not _is_finite_positive(m_val):
+                                reasons.append('INVALID_VALUATION')
+                            else:
+                                sym_mark = float(m_val)
 
-                gross = sum(abs(q) * price for q in positions.values()) + sum(self._reserved_notional.values()) + notional
-                if equity > 0 and (gross / equity) > self.profile.max_gross_exposure_pct + 1e-9:
-                    reasons.append('GROSS_EXPOSURE_LIMIT')
+                    current_sym_notional = abs(held_qty) * sym_mark + self._reserved_buy_notional_by_symbol(
+                        intent.account_id, intent.environment, sym
+                    )
+                    if ((current_sym_notional + notional) / float(equity)) > self.profile.max_concentration_pct + 1e-9:
+                        reasons.append('CONCENTRATION_LIMIT')
+
+                    # Per-instrument valuation for all held positions; fail closed if any non-order symbol lacks a mark.
+                    norm_marks: dict[str, float] = {}
+                    if marks is not None:
+                        for mk_sym, mk_val in marks.items():
+                            norm_marks[mk_sym.upper()] = mk_val
+
+                    held_gross = 0.0
+                    marks_valid = True
+                    for pos_sym, pos_qty_raw in positions.items():
+                        if not _is_finite(pos_qty_raw):
+                            reasons.append('INVALID_VALUATION')
+                            marks_valid = False
+                            break
+                        pos_qty = abs(float(pos_qty_raw))
+                        if pos_qty <= 1e-9:
+                            continue
+                        u_sym = pos_sym.upper()
+                        if u_sym == sym:
+                            pos_mark = sym_mark
+                        elif u_sym in norm_marks:
+                            m_other = norm_marks[u_sym]
+                            if not _is_finite_positive(m_other):
+                                reasons.append('INVALID_VALUATION')
+                                marks_valid = False
+                                break
+                            pos_mark = float(m_other)
+                        else:
+                            reasons.append('MISSING_POSITION_MARKS')
+                            marks_valid = False
+                            break
+                        held_gross += pos_qty * pos_mark
+
+                    if marks_valid:
+                        gross = held_gross + reserved_cash + notional
+                        if (gross / float(equity)) > self.profile.max_gross_exposure_pct + 1e-9:
+                            reasons.append('GROSS_EXPOSURE_LIMIT')
                 checks.append('exposure_limits')
 
-                if not reasons:
-                    self._reserved_notional[sym] = self._reserved_notional.get(sym, 0.0) + notional
+            if not reasons:
+                if intent.side == 'BUY':
+                    self._buy_reservations[order_key] = {
+                        'account_id': intent.account_id,
+                        'environment': intent.environment,
+                        'client_order_id': intent.client_order_id,
+                        'symbol': sym,
+                        'notional': float(intent.qty) * float(price),
+                        'intent_hash': i_hash,
+                        'risk_reducing': False,
+                    }
+                else:
+                    self._sell_reservations[order_key] = {
+                        'account_id': intent.account_id,
+                        'environment': intent.environment,
+                        'client_order_id': intent.client_order_id,
+                        'symbol': sym,
+                        'qty': float(intent.qty),
+                        'intent_hash': i_hash,
+                        'risk_reducing': is_risk_reducing,
+                    }
+                self._persist_to_store()
 
         return RiskDecision(
             approved=len(reasons) == 0,
-            intent_hash=intent.intent_hash(),
+            intent_hash=i_hash,
             account_revision=account_revision,
             checks=checks,
             reasons=reasons,
@@ -167,8 +362,24 @@ class IndependentRiskGate:
             policy_version=self.profile.profile_id,
         )
 
+    def release_order_reservation(self, account_id: str, environment: str, client_order_id: str) -> None:
+        key = self._order_key(account_id, environment, client_order_id)
+        with self._lock:
+            self._load_from_store()
+            changed = False
+            if key in self._buy_reservations:
+                del self._buy_reservations[key]
+                changed = True
+            if key in self._sell_reservations:
+                del self._sell_reservations[key]
+                changed = True
+            if changed:
+                self._persist_to_store()
+
     def release_reservation(self, symbol: str, notional: float) -> None:
         with self._lock:
+            self._load_from_store()
             sym = symbol.upper()
-            cur = self._reserved_notional.get(sym, 0.0)
-            self._reserved_notional[sym] = max(0.0, cur - notional)
+            cur = self._legacy_symbol_notional.get(sym, 0.0)
+            self._legacy_symbol_notional[sym] = max(0.0, cur - float(notional))
+            self._persist_to_store()
