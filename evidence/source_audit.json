@@ -1,0 +1,18 @@
+{
+  "review_date": "2026-11-14",
+  "repository": "https://github.com/shiyu-coder/Kronos",
+  "commit": "67b630e67f6a18c9e9be918d9b4337c960db1e9a",
+  "files_inspected": [
+    "model/kronos.py",
+    "model/module.py",
+    "README.md",
+    "LICENSE"
+  ],
+  "access": "GitHub connector and primary raw-source web reader",
+  "full_local_clone_obtained": false,
+  "pretrained_weights_obtained": false,
+  "pretrained_inference_executed": false,
+  "adapter_contract_tests_use_test_doubles": true,
+  "source_installer": "scripts/install_kronos.py",
+  "license": "MIT (source); model artifact terms require separate review"
+}

@@ -1,0 +1,11 @@
+{
+  "scope_version":"v5",
+  "master_platform":"AEGIS QuantOS",
+  "approved_workstreams":["QuantForge OS","QuantShield-FTMO"],
+  "model_integration":"Kronos",
+  "functional_reference_only":"Day Trader Skill",
+  "original_project_repository_integration":"NOT_VERIFIED_OR_PERFORMED",
+  "real_money_execution":false,
+  "external_paper_order_submission":false,
+  "additional_named_platforms":false
+}

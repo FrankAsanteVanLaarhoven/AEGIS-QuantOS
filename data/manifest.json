@@ -1,0 +1,20 @@
+{
+  "id": "81d28c22929976d6b7a1",
+  "label": "Semiconductor research basket \u00b7 seeded fixture",
+  "source": "SYNTHETIC",
+  "rows": 1800,
+  "bars_per_symbol": 360,
+  "symbols": [
+    "NVDA",
+    "AMAT",
+    "LRCX",
+    "TER",
+    "SPY"
+  ],
+  "sha256": "81d28c22929976d6b7a1c0122ded7e815dba5d645aa6eee285001df3ca6c0897",
+  "start": "2026-11-02T14:35:00Z",
+  "end": "2026-11-09T19:30:00Z",
+  "price_basis": "research snapshot; corporate actions not processed",
+  "survivorship_control": "not established",
+  "historical_latency": "availability must be supplied honestly by uploader"
+}

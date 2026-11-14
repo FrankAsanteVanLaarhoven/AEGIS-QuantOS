@@ -1,0 +1,8 @@
+# Optional. CUDA users should install the matching official torch build first.
+torch==2.10.0
+numpy==2.3.5
+pandas==2.2.3
+huggingface-hub==1.16.1
+safetensors==0.7.0
+einops==0.8.2
+tqdm>=4.67,<5

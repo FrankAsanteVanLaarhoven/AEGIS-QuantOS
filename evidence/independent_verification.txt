@@ -1,0 +1,2 @@
+PASS: 148 events; head=9ad64973164b923b4031721a079809812694377502e7913afd7f43a5d754c9dc
+An independently retained anchor is required to establish authenticity against a database administrator.

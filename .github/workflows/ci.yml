@@ -1,0 +1,17 @@
+name: offline-qualification
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements-dev.txt
+      - run: python -m pytest -q --junitxml=evidence/pytest-ci.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qualification
+          path: evidence/pytest-ci.xml

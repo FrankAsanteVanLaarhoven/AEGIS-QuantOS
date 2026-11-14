@@ -1,0 +1,90 @@
+{
+  "release": "0.2.0",
+  "scope": "v5",
+  "data": "SYNTHETIC_FIXTURE_NOT_MARKET_HISTORY",
+  "replay_bars_advanced": 60,
+  "stats": {
+    "equity": 100515.887968,
+    "cash": 70199.054668,
+    "gross": 30316.8333,
+    "gross_pct": 0.3016123511703105,
+    "pnl": 515.887968,
+    "return_pct": 0.515887968,
+    "drawdown_pct": 0.0,
+    "daily_loss_pct": 0.0
+  },
+  "positions": [
+    {
+      "symbol": "AMAT",
+      "qty": 32,
+      "average": 182.966523,
+      "mark": 185.5208,
+      "value": 5936.6656,
+      "unrealized": 81.736864
+    },
+    {
+      "symbol": "LRCX",
+      "qty": 71,
+      "average": 83.504877,
+      "mark": 85.4843,
+      "value": 6069.3853,
+      "unrealized": 140.539033
+    },
+    {
+      "symbol": "NVDA",
+      "qty": 45,
+      "average": 132.531578,
+      "mark": 132.6064,
+      "value": 5967.288,
+      "unrealized": 3.36699
+    },
+    {
+      "symbol": "SPY",
+      "qty": 11,
+      "average": 545.41578,
+      "mark": 565.387,
+      "value": 6219.257,
+      "unrealized": 219.68342
+    },
+    {
+      "symbol": "TER",
+      "qty": 58,
+      "average": 103.191383,
+      "mark": 105.5903,
+      "value": 6124.2374,
+      "unrealized": 139.137186
+    }
+  ],
+  "order_status_counts": {
+    "FILLED": 13
+  },
+  "reconciliation": {
+    "valid": true,
+    "filled_orders": 13,
+    "cash_difference": "0.000000",
+    "expected_cash": "70199.054668",
+    "expected_positions": {
+      "NVDA": 45,
+      "AMAT": 32,
+      "TER": 58,
+      "SPY": 11,
+      "LRCX": 71
+    },
+    "actual_positions": {
+      "AMAT": 32,
+      "LRCX": 71,
+      "NVDA": 45,
+      "SPY": 11,
+      "TER": 58
+    },
+    "scope": "Current local paper session; broker reconciliation is a separate read-only connector"
+  },
+  "ledger": {
+    "valid": true,
+    "events": 148,
+    "head": "9ad64973164b923b4031721a079809812694377502e7913afd7f43a5d754c9dc",
+    "limitation": "A database administrator can rewrite both the chain and its local head. Export and separately retain anchors."
+  },
+  "live_orders_executed": 0,
+  "performance_claim": "NONE"
+}

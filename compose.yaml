@@ -1,0 +1,15 @@
+services:
+  workspace:
+    build: .
+    ports: ["127.0.0.1:8765:8765"]
+    environment:
+      AEGIS_TOKEN: ${AEGIS_TOKEN:?Set a strong random AEGIS_TOKEN before starting Compose}
+      AEGIS_DB: /app/runtime/aegis.sqlite3
+    volumes: ["aegis-data:/app/runtime"]
+    restart: unless-stopped
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    tmpfs: ["/tmp"]
+volumes:
+  aegis-data:

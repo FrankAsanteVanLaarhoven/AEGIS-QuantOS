@@ -1,0 +1,21 @@
+{
+  "local_paper_execution":"IMPLEMENTED_AND_TESTED",
+  "persistent_accounting":"IMPLEMENTED_AND_TESTED",
+  "account_reconciliation":"IMPLEMENTED_AND_TESTED",
+  "scanner_and_rule_workers":"IMPLEMENTED_AND_TESTED",
+  "scenario_simulation":"IMPLEMENTED_AND_TESTED",
+  "chronological_backtest":"IMPLEMENTED_AND_TESTED_ON_SYNTHETIC_DATA",
+  "interactive_workspace":"IMPLEMENTED_BROWSER_TESTED_WITH_HTTP_BRIDGE",
+  "kronos_inference_adapter":"IMPLEMENTED_CONTRACT_TESTED",
+  "kronos_official_source_clone":"INSTALLER_PROVIDED_NOT_DOWNLOADED_HERE",
+  "kronos_pretrained_inference":"NOT_RUN_WEIGHTS_NOT_AVAILABLE",
+  "sec_connector":"IMPLEMENTED_MOCK_TRANSPORT_TESTED_NEEDS_REAL_USER_AGENT",
+  "alpaca_paper_account_read":"IMPLEMENTED_MOCK_TRANSPORT_TESTED_NEEDS_CREDENTIALS",
+  "licensed_live_market_feed":"NOT_IMPLEMENTED",
+  "llm_agent_swarm":"NOT_IMPLEMENTED_DETERMINISTIC_WORKERS_ONLY",
+  "reinforcement_learning_training":"NOT_IMPLEMENTED",
+  "funded_account_rule_certification":"NOT_ESTABLISHED",
+  "enterprise_multi_tenant_security":"NOT_IMPLEMENTED",
+  "docker_and_remote_ci":"CONFIGURATIONS_PROVIDED_NOT_EXECUTED",
+  "sota_or_profitability_claim":"NONE"
+}

@@ -1,0 +1,17 @@
+test_duplicate_conflict (test_m0.M0.test_duplicate_conflict) ... ok
+test_duplicate_idempotent (test_m0.M0.test_duplicate_idempotent) ... ok
+test_fill_and_replay (test_m0.M0.test_fill_and_replay) ... ok
+test_future_data_block (test_m0.M0.test_future_data_block) ... ok
+test_insufficient_cash (test_m0.M0.test_insufficient_cash) ... ok
+test_kill_switch (test_m0.M0.test_kill_switch) ... ok
+test_no_lookahead_signal (test_m0.M0.test_no_lookahead_signal) ... ok
+test_no_short (test_m0.M0.test_no_short) ... ok
+test_order_limit (test_m0.M0.test_order_limit) ... ok
+test_rejected_order_does_not_mutate_cash (test_m0.M0.test_rejected_order_does_not_mutate_cash) ... ok
+test_stale_data_block (test_m0.M0.test_stale_data_block) ... ok
+test_tamper_detection (test_m0.M0.test_tamper_detection) ... ok
+
+----------------------------------------------------------------------
+Ran 12 tests in 0.001s
+
+OK

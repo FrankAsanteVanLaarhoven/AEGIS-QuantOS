@@ -1,0 +1,29 @@
+{
+  "checks": [
+    "Authenticated workspace renders",
+    "View renders: markets",
+    "View renders: research",
+    "View renders: kronos",
+    "View renders: simulation",
+    "View renders: portfolio",
+    "View renders: execution",
+    "View renders: risk",
+    "View renders: evidence",
+    "View renders: integrations",
+    "View renders: overview",
+    "Paper order queued and filled through UI",
+    "Halt and resume through UI",
+    "Bootstrap experiment renders computed envelope",
+    "Backtest results and equity chart render",
+    "DCF calculator updates numerical output",
+    "Unavailable model returns explicit failure, no mock output",
+    "Keyboard-command navigation works",
+    "430px mobile layout: no page overflow"
+  ],
+  "passed": 19,
+  "page_errors": [],
+  "browser": "Chromium / Playwright",
+  "transport": "HTTP bridge (native navigation restricted)",
+  "screenshots": "evidence/ui_*.png",
+  "scope": "Local synthetic paper workflow; external provider and pretrained model execution not tested"
+}

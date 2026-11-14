@@ -1,0 +1,10 @@
+.venv/
+.env
+runtime/
+models/
+vendor/Kronos/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.sqlite3*
+*.db
