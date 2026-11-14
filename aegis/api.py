@@ -28,6 +28,8 @@ from .providers.registry import provider_registry
 from .llm.gateway import OpenRouterGateway
 from .jobs.queue import DurableJobManager
 from .agents.coordinator import ResearchCoordinator
+from .risk.policy import DEFAULT_PROFILES
+from .brokers.alpaca_paper import AlpacaPaperOMS
 
 ROOT=Path(__file__).resolve().parents[1]
 class Model(BaseModel): model_config=ConfigDict(extra='forbid',allow_inf_nan=False)
@@ -84,7 +86,8 @@ def create_app(db_path=None,token=None):
     llm_gateway=OpenRouterGateway(settings,resolver)
     job_manager=DurableJobManager()
     coordinator=ResearchCoordinator(evidence_store,llm_gateway)
-    app.state.service=service; app.state.token=auth_token; app.state.settings=settings; app.state.secrets=resolver; app.state.market_supervisor=supervisor; app.state.evidence_store=evidence_store; app.state.llm_gateway=llm_gateway; app.state.job_manager=job_manager
+    paper_oms=AlpacaPaperOMS(settings,resolver)
+    app.state.service=service; app.state.token=auth_token; app.state.settings=settings; app.state.secrets=resolver; app.state.market_supervisor=supervisor; app.state.evidence_store=evidence_store; app.state.llm_gateway=llm_gateway; app.state.job_manager=job_manager; app.state.paper_oms=paper_oms
     app.add_middleware(TrustedHostMiddleware,allowed_hosts=['localhost','127.0.0.1','testserver','[::1]'])
     @app.middleware('http')
     async def boundary(request:Request,call_next):
@@ -249,6 +252,10 @@ def create_app(db_path=None,token=None):
             'models_lock': llm_gateway.lock,
             'budget': llm_gateway.budget.snapshot(),
         }
+    @app.get('/api/risk/profiles')
+    def risk_profiles():return {k:v.model_dump(mode='json') for k,v in DEFAULT_PROFILES.items()}
+    @app.get('/api/broker/paper-orders')
+    def paper_orders():return {'execution_mode':settings.execution_mode,'live_money_enabled':False,'outbox':paper_oms.outbox_snapshot()}
     @app.get('/api/broker/paper-account')
     def broker():return alpaca_read()
     @app.get('/api/audit')
