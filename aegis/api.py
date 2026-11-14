@@ -24,6 +24,7 @@ from .providers.alpaca_market import AlpacaMarketAdapter
 from .providers.evidence import EvidenceStore
 from .providers.sec import SecEdgarAdapter
 from .providers.registry import provider_registry
+from .llm.gateway import OpenRouterGateway
 
 ROOT=Path(__file__).resolve().parents[1]
 class Model(BaseModel): model_config=ConfigDict(extra='forbid',allow_inf_nan=False)
@@ -76,7 +77,8 @@ def create_app(db_path=None,token=None):
     alpaca_market=AlpacaMarketAdapter(settings,resolver,supervisor)
     evidence_store=EvidenceStore()
     sec_adapter=SecEdgarAdapter(settings)
-    app.state.service=service; app.state.token=auth_token; app.state.settings=settings; app.state.secrets=resolver; app.state.market_supervisor=supervisor; app.state.evidence_store=evidence_store
+    llm_gateway=OpenRouterGateway(settings,resolver)
+    app.state.service=service; app.state.token=auth_token; app.state.settings=settings; app.state.secrets=resolver; app.state.market_supervisor=supervisor; app.state.evidence_store=evidence_store; app.state.llm_gateway=llm_gateway
     app.add_middleware(TrustedHostMiddleware,allowed_hosts=['localhost','127.0.0.1','testserver','[::1]'])
     @app.middleware('http')
     async def boundary(request:Request,call_next):
@@ -215,6 +217,15 @@ def create_app(db_path=None,token=None):
         else:
             docs=[d for d in evidence_store.all_documents() if not symbol or d.entity_symbol==symbol.upper()]
         return {'count':len(docs),'documents':[d.model_dump(mode='json') for d in docs],'registry':provider_registry(settings,resolver)}
+    @app.get('/api/llm/status')
+    def llm_status():
+        return {
+            'provider': settings.llm_provider,
+            'paid_calls_authorized': settings.enable_paid_llm,
+            'key_state': resolver.status('OPENROUTER_API_KEY').state,
+            'models_lock': llm_gateway.lock,
+            'budget': llm_gateway.budget.snapshot(),
+        }
     @app.get('/api/broker/paper-account')
     def broker():return alpaca_read()
     @app.get('/api/audit')

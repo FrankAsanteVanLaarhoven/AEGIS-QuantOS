@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "status": "UNQUALIFIED_NO_CREDENTIALS",
+  "note": "Model IDs remain null until an authorized OpenRouter catalog check and role evaluation are executed.",
+  "roles": {
+    "filing_extractor": {"model_id": null, "approved_fallbacks": []},
+    "market_researcher": {"model_id": null, "approved_fallbacks": []},
+    "hypothesis_author": {"model_id": null, "approved_fallbacks": []},
+    "evidence_checker": {"model_id": null, "approved_fallbacks": []},
+    "report_explainer": {"model_id": null, "approved_fallbacks": []}
+  }
+}
