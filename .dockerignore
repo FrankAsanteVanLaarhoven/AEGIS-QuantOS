@@ -1,0 +1,16 @@
+.git/
+.venv/
+.env
+.env.*
+*.key
+*.pem
+runtime/
+models/
+vendor/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.sqlite3*
+*.db
+evidence/
+tests_handoff/

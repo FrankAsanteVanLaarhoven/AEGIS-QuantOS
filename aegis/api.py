@@ -17,6 +17,8 @@ from .quant import bootstrap, correlation, valuation
 from .research import backtest
 from . import kronos_adapter as kronos
 from .connectors import connector_status, sec_filings, alpaca_read
+from .settings import build_runtime_context
+from .doctor import run_doctor
 
 ROOT=Path(__file__).resolve().parents[1]
 class Model(BaseModel): model_config=ConfigDict(extra='forbid',allow_inf_nan=False)
@@ -37,8 +39,9 @@ class Alert(Model): symbol:str; price:float=Field(gt=0); direction:Literal['abov
 class DCF(Model): fcf:float=Field(gt=0); growth:float; discount:float; terminal_growth:float; years:int=Field(ge=1,le=15); shares:float=Field(gt=0); debt:float=Field(default=0,ge=0); cash:float=Field(default=0,ge=0)
 
 def create_app(db_path=None,token=None):
-    service=Service(db_path or os.getenv('AEGIS_DB',str(ROOT/'runtime'/'aegis.sqlite3')))
-    auth_token=token or os.getenv('AEGIS_TOKEN') or secrets.token_urlsafe(32)
+    settings,resolver=build_runtime_context()
+    service=Service(db_path or str(settings.db_path))
+    auth_token=token or resolver.resolve('AEGIS_TOKEN') or secrets.token_urlsafe(32)
     sessions={}; attempts={}; heavy=__import__('threading').Lock()
     with service.store.tx():
         s=service.s(); s['running']=False; service.store.put('state',s)
@@ -62,14 +65,14 @@ def create_app(db_path=None,token=None):
         try: await task
         except asyncio.CancelledError: pass
     app=FastAPI(title='AEGIS QuantOS',version='0.2.0',lifespan=lifespan,docs_url=None,redoc_url=None,openapi_url=None)
-    app.state.service=service; app.state.token=auth_token
+    app.state.service=service; app.state.token=auth_token; app.state.settings=settings; app.state.secrets=resolver
     app.add_middleware(TrustedHostMiddleware,allowed_hosts=['localhost','127.0.0.1','testserver','[::1]'])
     @app.middleware('http')
     async def boundary(request:Request,call_next):
         origin=request.headers.get('origin')
         if origin and urlsplit(origin).netloc!=request.headers.get('host'):
             return JSONResponse({'detail':'Cross-origin access denied'},status_code=403)
-        if request.url.path.startswith('/api/') and request.url.path not in ['/api/login','/api/health']:
+        if request.url.path.startswith('/api/') and request.url.path not in ['/api/login','/api/health','/api/ready']:
             session=sessions.get(request.cookies.get('aegis_session'))
             if not session or session['expires']<time.time(): return JSONResponse({'detail':'Session required'},status_code=401)
             if request.method not in ['GET','HEAD'] and not hmac.compare_digest(request.headers.get('X-Aegis-CSRF',''),session['csrf']): return JSONResponse({'detail':'CSRF token required'},status_code=403)
@@ -91,6 +94,10 @@ def create_app(db_path=None,token=None):
     async def external_error(request,exc): return JSONResponse({'detail':'External provider request failed. Check network, permissions and provider status.','error_type':type(exc).__name__},status_code=502)
     @app.get('/api/health')
     def health():return {'status':'ok','version':'0.2.0','mode':'PAPER_ONLY','live_execution':False}
+    @app.get('/api/ready')
+    def ready():
+        doc=run_doctor(settings,resolver,check_network=False)
+        return {'process':'ok','data_mode':settings.data_mode,'execution_mode':settings.execution_mode,'live_execution':False,'providers':{k:{'configured':v['configured'],'qualified':v['qualified']} for k,v in doc['providers'].items()}}
     @app.post('/api/login')
     def login(body:Login,request:Request):
         host=request.client.host if request.client else 'unknown'; now=time.time(); recent=[t for t in attempts.get(host,[]) if now-t<60]; attempts[host]=recent+[now]
@@ -170,8 +177,12 @@ def create_app(db_path=None,token=None):
         return result
     @app.post('/api/alerts')
     def alerts(body:Alert):return service.alert(**body.model_dump())
+    @app.get('/api/doctor')
+    def doctor():return run_doctor(settings,resolver,check_network=False)
     @app.get('/api/integrations')
-    def integrations():return {'kronos':kronos.status(),'connectors':connector_status(),'external_order_submission':False,'original_project_repositories':'NOT_AVAILABLE; native scoped modules, not imported private code'}
+    def integrations():
+        doc=run_doctor(settings,resolver,check_network=False)
+        return {'kronos':kronos.status(),'connectors':connector_status(),'providers':doc['providers'],'settings':doc['settings'],'external_order_submission':False,'original_project_repositories':'NOT_AVAILABLE; native scoped modules, not imported private code'}
     @app.get('/api/filings/{cik}')
     def filings(cik:str):
         result=sec_filings(cik)
