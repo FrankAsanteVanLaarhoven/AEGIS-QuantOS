@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import hashlib
 import re
+import threading
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 INJECTION_PATTERNS = (
@@ -113,29 +114,61 @@ class SourceDocument(BaseModel):
 
 
 class EvidenceStore:
-    """In-memory bitemporal document store preserving amendments and point-in-time cutoffs."""
+    """Bitemporal document store (in-memory + optional SQLite Store) preserving amendments and point-in-time cutoffs."""
 
-    def __init__(self) -> None:
+    def __init__(self, store: Any = None) -> None:
+        self._store = store
+        self._lock = threading.RLock()
         self._docs: dict[str, SourceDocument] = {}
+        self._ensure_schema()
+        self._load_all()
+
+    def _ensure_schema(self) -> None:
+        if self._store is None:
+            return
+        with self._store.lock:
+            self._store.db.executescript(
+                'CREATE TABLE IF NOT EXISTS evidence_documents (doc_id TEXT PRIMARY KEY, doc_json TEXT NOT NULL);'
+            )
+
+    def _load_all(self) -> None:
+        if self._store is None:
+            return
+        with self._store.lock:
+            rows = self._store.db.execute('SELECT doc_id, doc_json FROM evidence_documents').fetchall()
+            self._docs = {r['doc_id']: SourceDocument.model_validate_json(r['doc_json']) for r in rows}
+
+    def _persist(self, doc: SourceDocument) -> None:
+        self._docs[doc.doc_id] = doc
+        if self._store is None:
+            return
+        with self._store.tx():
+            self._store.db.execute(
+                'INSERT INTO evidence_documents(doc_id, doc_json) VALUES (?, ?) '
+                'ON CONFLICT(doc_id) DO UPDATE SET doc_json = excluded.doc_json',
+                (doc.doc_id, doc.model_dump_json()),
+            )
 
     def add(self, doc: SourceDocument) -> SourceDocument:
-        if doc.doc_id in self._docs:
-            existing = self._docs[doc.doc_id]
-            if existing.content_hash == doc.content_hash:
-                return existing
-            # Create a new versioned record rather than overwriting
-            new_ver = existing.version + 1
-            amended = doc.model_copy(
-                update={
-                    'doc_id': f'{doc.doc_id}:v{new_ver}',
-                    'version': new_ver,
-                    'supersedes_doc_id': existing.doc_id,
-                }
-            )
-            self._docs[amended.doc_id] = amended
-            return amended
-        self._docs[doc.doc_id] = doc
-        return doc
+        with self._lock:
+            self._load_all()
+            if doc.doc_id in self._docs:
+                existing = self._docs[doc.doc_id]
+                if existing.content_hash == doc.content_hash:
+                    return existing
+                # Create a new versioned record rather than overwriting
+                new_ver = existing.version + 1
+                amended = doc.model_copy(
+                    update={
+                        'doc_id': f'{doc.doc_id}:v{new_ver}',
+                        'version': new_ver,
+                        'supersedes_doc_id': existing.doc_id,
+                    }
+                )
+                self._persist(amended)
+                return amended
+            self._persist(doc)
+            return doc
 
     def as_of(
         self,
@@ -145,18 +178,23 @@ class EvidenceStore:
         source_kind: str | None = None,
     ) -> list[SourceDocument]:
         cut_utc = cutoff.astimezone(timezone.utc) if cutoff.tzinfo else cutoff.replace(tzinfo=timezone.utc)
-        out = []
-        for doc in self._docs.values():
-            if not doc.point_in_time_eligible:
-                continue
-            if doc.available_at.astimezone(timezone.utc) > cut_utc:
-                continue
-            if symbol and doc.entity_symbol != symbol.upper():
-                continue
-            if source_kind and doc.source_kind != source_kind:
-                continue
-            out.append(doc)
-        return sorted(out, key=lambda d: (d.available_at, d.version))
+        with self._lock:
+            self._load_all()
+            out = []
+            for doc in self._docs.values():
+                if not doc.point_in_time_eligible:
+                    continue
+                if doc.available_at.astimezone(timezone.utc) > cut_utc:
+                    continue
+                if symbol and doc.entity_symbol != symbol.upper():
+                    continue
+                if source_kind and doc.source_kind != source_kind:
+                    continue
+                out.append(doc)
+            return sorted(out, key=lambda d: (d.available_at, d.version))
 
     def all_documents(self) -> list[SourceDocument]:
-        return list(self._docs.values())
+        with self._lock:
+            self._load_all()
+            return list(self._docs.values())
+

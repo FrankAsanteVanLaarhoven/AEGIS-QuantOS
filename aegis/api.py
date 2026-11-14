@@ -48,7 +48,9 @@ class Upload(Model): label:str=Field(default='Imported dataset',max_length=120);
 class Reset(Model): confirm:str; capital:float=Field(default=100000,ge=1000,le=10000000)
 class Alert(Model): symbol:str; price:float=Field(gt=0); direction:Literal['above','below']
 class DCF(Model): fcf:float=Field(gt=0); growth:float; discount:float; terminal_growth:float; years:int=Field(ge=1,le=15); shares:float=Field(gt=0); debt:float=Field(default=0,ge=0); cash:float=Field(default=0,ge=0)
-class AgentJob(Model): symbol:str=Field(max_length=12); arm:Literal['deterministic_baseline','retrieval_assisted_llm','verified_multi_role']='deterministic_baseline'
+class AgentJob(Model):
+    symbol:str=Field(max_length=12); arm:Literal['deterministic_baseline','retrieval_assisted_llm','verified_multi_role']='deterministic_baseline'
+    numerical_inputs:dict[str,float]|None=None
 
 def create_app(db_path=None,token=None):
     settings,resolver=build_runtime_context()
@@ -93,10 +95,10 @@ def create_app(db_path=None,token=None):
     if not (resolver.resolve('ALPACA_API_KEY') and resolver.resolve('ALPACA_SECRET_KEY')) and settings.data_mode in ('live','delayed'):
         supervisor.mark_blocked_credential('Alpaca market-data credentials missing')
     alpaca_market=AlpacaMarketAdapter(settings,resolver,supervisor)
-    evidence_store=EvidenceStore()
+    evidence_store=EvidenceStore(store=service.store)
     sec_adapter=SecEdgarAdapter(settings)
     llm_gateway=OpenRouterGateway(settings,resolver,store=service.store)
-    job_manager=DurableJobManager()
+    job_manager=DurableJobManager(store=service.store)
     coordinator=ResearchCoordinator(evidence_store,llm_gateway)
     risk_gate=IndependentRiskGate(store=service.store)
     paper_oms=AlpacaPaperOMS(settings,resolver,store=service.store,risk_gate=risk_gate)
@@ -260,9 +262,20 @@ def create_app(db_path=None,token=None):
     def list_agent_jobs():return {'jobs':job_manager.list_jobs()}
     @app.post('/api/agents/jobs')
     def run_agent_job(body:AgentJob):
+        from datetime import datetime,timezone
         rec=job_manager.create('research_arm',body.symbol)
         job_manager.record_step(rec.job_id,'dispatch',{'arm':body.arm})
-        out=coordinator.run_arm(arm=body.arm,job_id=rec.job_id,symbol=body.symbol,numerical_inputs={'fcf':120,'growth':0.08,'discount':0.11,'terminal_growth':0.03,'years':5,'shares':10})
+        docs_now=evidence_store.as_of(datetime.now(timezone.utc),symbol=body.symbol.upper())
+        if body.numerical_inputs is None and not docs_now and body.arm=='deterministic_baseline':
+            out={'arm':body.arm,'job_id':rec.job_id,'symbol':body.symbol.upper(),'status':'ABSTAINED','abstain_reason':'No sourced numerical valuation inputs or point-in-time evidence available','evidence_count':0,'llm_calls':0,'cost_usd':0.0}
+            job_manager.finish(rec.job_id,'ABSTAINED',result=out)
+            return job_manager.get(rec.job_id).model_dump(mode='json')
+        if body.numerical_inputs is not None:
+            required={'fcf','growth','discount','terminal_growth','years','shares'}
+            missing=sorted(required-set(body.numerical_inputs.keys()))
+            if missing:
+                raise ValueError('Missing valuation inputs: '+','.join(missing))
+        out=coordinator.run_arm(arm=body.arm,job_id=rec.job_id,symbol=body.symbol,numerical_inputs=body.numerical_inputs)
         st='COMPLETED' if out.get('status')=='COMPLETED' else ('ABSTAINED' if out.get('status')=='ABSTAINED' else 'BLOCKED')
         job_manager.finish(rec.job_id,st,result=out)
         return job_manager.get(rec.job_id).model_dump(mode='json')
