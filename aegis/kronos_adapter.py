@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib, importlib, json, math, os, sys, threading, time
 from pathlib import Path
 from .data import dt, digest
+from .market.calendar import forward_bar_timestamps
 
 COMMIT='67b630e67f6a18c9e9be918d9b4337c960db1e9a'
 ROOT=Path(__file__).resolve().parents[1]
@@ -62,18 +63,22 @@ def load():
             _cached=(key,predictor); return predictor,m
         except Exception as exc: raise ModelUnavailable('Kronos load failed: '+str(exc)) from exc
 
-def forecast(dataset,index,symbol,horizon=12,samples=4,seed=26):
+def forecast(dataset,index,symbol,horizon=12,samples=4,seed=26,use_exchange_calendar=False):
     if symbol not in dataset.symbols or not 1<=horizon<=60 or not 2<=samples<=16: raise ValueError('Invalid forecast bounds')
-    # Future timestamp calendar is supplied by the replay dataset. No future prices are exposed.
-    if index+horizon>=dataset.length: raise ValueError('Not enough declared future calendar timestamps; shorten horizon')
     bars=dataset.prefix(symbol,index)
+    if use_exchange_calendar:
+        future_ts=[ts.isoformat() for ts in forward_bar_timestamps(dt(bars[-1]['timestamp']),horizon,bar_minutes=15)]
+    elif index+horizon>=dataset.length:
+        raise ValueError('Not enough declared future calendar timestamps; shorten horizon or pass use_exchange_calendar=True')
+    else:
+        future_ts=[dataset.row(symbol,i)['timestamp'] for i in range(index+1,index+horizon+1)]
     with LOCK:
         predictor,m=load()
         import numpy as np, pandas as pd, torch
         bars=bars[-m['max_context']:]; frame=pd.DataFrame([{k:b[k] for k in ('open','high','low','close','volume')} for b in bars])
         # Upstream imputes traded amount as volume * mean(OHLC); disclose it.
         x=pd.Series(pd.to_datetime([b['timestamp'] for b in bars],utc=True))
-        y=pd.Series(pd.to_datetime([dataset.row(symbol,i)['timestamp'] for i in range(index+1,index+horizon+1)],utc=True))
+        y=pd.Series(pd.to_datetime(future_ts,utc=True))
         raw=[]; begun=time.perf_counter()
         with torch.random.fork_rng(devices=list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []):
             with torch.inference_mode():
