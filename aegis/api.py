@@ -15,6 +15,7 @@ from .engine import Service
 from .data import from_csv
 from .quant import bootstrap, correlation, valuation
 from .research import backtest
+from .quant_eval import evaluate_candidates
 from . import kronos_adapter as kronos
 from .connectors import connector_status, sec_filings, alpaca_read
 from .settings import build_runtime_context
@@ -188,6 +189,9 @@ def create_app(db_path=None,token=None):
         finally:heavy.release()
     @app.get('/api/research/results')
     def results():return service.store.results()
+    @app.post('/api/research/evaluate')
+    def evaluate_research():
+        return evaluate_candidates(service.dataset)
     @app.get('/api/correlation')
     def correlations():return correlation(service.dataset,service.s()['index'])
     @app.post('/api/valuation')
