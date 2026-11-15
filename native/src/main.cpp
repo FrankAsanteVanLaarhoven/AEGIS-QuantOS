@@ -69,13 +69,15 @@ int main(int argc, char** argv) {
             std::string ckpt_hash;
             auto model = aq::ActorCritic::load_checkpoint(argv[2], &ckpt_hash);
             auto ds = aq::load_csv_file(argv[3], "SYNTHETIC");
-            auto rep = aq::run_shadow_parity_check(ds, aq::default_sim_config(), &model, ckpt_hash);
-            std::cout << "{\"command\":\"shadow\",\"exact_accounting_parity\":" << (rep.exact_accounting_parity ? "true" : "false")
-                      << ",\"exact_verdict_parity\":" << (rep.exact_verdict_parity ? "true" : "false")
-                      << ",\"steps_compared\":" << rep.steps_compared
-                      << ",\"native_final_equity_cents\":" << rep.native_final_equity_cents
-                      << ",\"receipt_hash\":\"" << rep.native_receipt_hash << "\"}\n";
-            return (rep.exact_accounting_parity && rep.exact_verdict_parity) ? 0 : 1;
+            auto rep = aq::run_replay_repeatability_check(ds, aq::default_sim_config(), &model, ckpt_hash);
+            std::vector<uint32_t> tape(ds.bars.size() - 17, 1);
+            auto par = aq::run_independent_shadow_parity(ds, aq::default_sim_config(), tape);
+            std::cout << "{\"command\":\"shadow\",\"exact_repeatability\":" << (rep.exact_repeatability ? "true" : "false")
+                      << ",\"exact_per_event_parity\":" << (par.exact_per_event_parity ? "true" : "false")
+                      << ",\"events_compared\":" << par.events_compared
+                      << ",\"native_final_equity_cents\":" << par.native_final_equity_cents
+                      << ",\"receipt_hash\":\"" << rep.receipt_hash << "\"}\n";
+            return (rep.exact_repeatability && par.exact_per_event_parity) ? 0 : 1;
         }
         if (cmd == "serve") {
             if (argc < 5) return 2;

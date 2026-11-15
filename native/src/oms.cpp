@@ -90,25 +90,53 @@ bool is_terminal_state(OrderState st) {
 OmsOrderRecord row_to_order(sqlite3_stmt* s) {
     OmsOrderRecord r;
     r.client_order_id = reinterpret_cast<const char*>(sqlite3_column_text(s, 0));
-    r.env = reinterpret_cast<const char*>(sqlite3_column_text(s, 1));
-    r.symbol = reinterpret_cast<const char*>(sqlite3_column_text(s, 2));
-    r.side = static_cast<uint8_t>(sqlite3_column_int(s, 3));
-    r.order_type = static_cast<uint8_t>(sqlite3_column_int(s, 4));
-    r.qty = sqlite3_column_int64(s, 5);
-    r.filled_qty = sqlite3_column_int64(s, 6);
-    r.limit_price_cents = sqlite3_column_int64(s, 7);
-    r.reserved_cash_cents = sqlite3_column_int64(s, 8);
-    r.reserved_sell_qty = sqlite3_column_int64(s, 9);
-    r.state = order_state_from_str(reinterpret_cast<const char*>(sqlite3_column_text(s, 10)));
-    r.account_revision = static_cast<uint64_t>(sqlite3_column_int64(s, 11));
-    r.control_epoch = static_cast<uint64_t>(sqlite3_column_int64(s, 12));
-    r.policy_hash = reinterpret_cast<const char*>(sqlite3_column_text(s, 13));
-    const unsigned char* bid = sqlite3_column_text(s, 14);
+    r.account_id = reinterpret_cast<const char*>(sqlite3_column_text(s, 1));
+    r.env = reinterpret_cast<const char*>(sqlite3_column_text(s, 2));
+    r.symbol = reinterpret_cast<const char*>(sqlite3_column_text(s, 3));
+    r.side = static_cast<uint8_t>(sqlite3_column_int(s, 4));
+    r.order_type = static_cast<uint8_t>(sqlite3_column_int(s, 5));
+    r.time_in_force = reinterpret_cast<const char*>(sqlite3_column_text(s, 6));
+    r.qty = sqlite3_column_int64(s, 7);
+    r.filled_qty = sqlite3_column_int64(s, 8);
+    r.limit_price_cents = sqlite3_column_int64(s, 9);
+    r.stop_cents = sqlite3_column_int64(s, 10);
+    r.target_cents = sqlite3_column_int64(s, 11);
+    r.fee_allowance_bps = sqlite3_column_int64(s, 12);
+    r.reserved_cash_cents = sqlite3_column_int64(s, 13);
+    r.reserved_sell_qty = sqlite3_column_int64(s, 14);
+    r.cumulative_executed_notional_cents = sqlite3_column_int64(s, 15);
+    r.cumulative_fees_cents = sqlite3_column_int64(s, 16);
+    r.state = order_state_from_str(reinterpret_cast<const char*>(sqlite3_column_text(s, 17)));
+    r.account_revision = static_cast<uint64_t>(sqlite3_column_int64(s, 18));
+    r.control_epoch = static_cast<uint64_t>(sqlite3_column_int64(s, 19));
+    r.policy_hash = reinterpret_cast<const char*>(sqlite3_column_text(s, 20));
+    r.request_hash = reinterpret_cast<const char*>(sqlite3_column_text(s, 21));
+    const unsigned char* bid = sqlite3_column_text(s, 22);
     r.broker_order_id = bid ? reinterpret_cast<const char*>(bid) : "";
-    r.reason_mask = static_cast<uint32_t>(sqlite3_column_int64(s, 15));
-    const unsigned char* lerr = sqlite3_column_text(s, 16);
+    r.reason_mask = static_cast<uint32_t>(sqlite3_column_int64(s, 23));
+    const unsigned char* lerr = sqlite3_column_text(s, 24);
     r.last_error = lerr ? reinterpret_cast<const char*>(lerr) : "";
     return r;
+}
+
+const char* kSelectOrderCols =
+    "SELECT client_order_id, account_id, env, symbol, side, order_type, time_in_force,"
+    " qty, filled_qty, limit_price_cents, stop_cents, target_cents, fee_allowance_bps,"
+    " reserved_cash_cents, reserved_sell_qty, cumulative_executed_notional_cents,"
+    " cumulative_fees_cents, state, account_revision, control_epoch, policy_hash,"
+    " request_hash, broker_order_id, reason_mask, last_error FROM aq_oms_orders ";
+
+int64_t compute_buy_reserve(int64_t rem_qty, int64_t limit_px, int64_t fee_bps) {
+    if (rem_qty <= 0) return 0;
+    int64_t principal = 0;
+    int64_t fee_num = 0;
+    int64_t total = 0;
+    if (aq_checked_mul_i64(rem_qty, limit_px, &principal) != AQ_OK ||
+        aq_checked_mul_i64(principal, fee_bps, &fee_num) != AQ_OK ||
+        aq_checked_add_i64(principal, (fee_num + 9999) / 10000, &total) != AQ_OK) {
+        throw std::overflow_error("compute_buy_reserve overflow");
+    }
+    return total;
 }
 
 }  // namespace
@@ -149,7 +177,6 @@ struct NativeOms::Impl {
     sqlite3* db = nullptr;
     SqliteStore store;
     ControlJournal control;
-    std::string last_control_reason;
     mutable std::mutex mu;
 
     explicit Impl(const std::string& path) : store(path), control(store) {
@@ -181,24 +208,41 @@ struct NativeOms::Impl {
             ");"
             "CREATE TABLE IF NOT EXISTS aq_oms_orders ("
             "  client_order_id TEXT PRIMARY KEY,"
+            "  account_id TEXT NOT NULL,"
             "  env TEXT NOT NULL,"
             "  symbol TEXT NOT NULL,"
             "  side INTEGER NOT NULL,"
             "  order_type INTEGER NOT NULL,"
+            "  time_in_force TEXT NOT NULL,"
             "  qty INTEGER NOT NULL,"
             "  filled_qty INTEGER NOT NULL,"
             "  limit_price_cents INTEGER NOT NULL,"
+            "  stop_cents INTEGER NOT NULL,"
+            "  target_cents INTEGER NOT NULL,"
+            "  fee_allowance_bps INTEGER NOT NULL,"
             "  reserved_cash_cents INTEGER NOT NULL,"
             "  reserved_sell_qty INTEGER NOT NULL,"
+            "  cumulative_executed_notional_cents INTEGER NOT NULL,"
+            "  cumulative_fees_cents INTEGER NOT NULL,"
             "  state TEXT NOT NULL,"
             "  account_revision INTEGER NOT NULL,"
             "  control_epoch INTEGER NOT NULL,"
             "  policy_hash TEXT NOT NULL,"
+            "  request_hash TEXT NOT NULL,"
             "  broker_order_id TEXT NOT NULL,"
             "  reason_mask INTEGER NOT NULL,"
             "  last_error TEXT NOT NULL,"
             "  created_at TEXT NOT NULL,"
             "  updated_at TEXT NOT NULL"
+            ");"
+            "CREATE TABLE IF NOT EXISTS aq_oms_executions ("
+            "  exec_id TEXT PRIMARY KEY,"
+            "  client_order_id TEXT NOT NULL,"
+            "  exec_qty INTEGER NOT NULL,"
+            "  exec_price_cents INTEGER NOT NULL,"
+            "  fee_cents INTEGER NOT NULL,"
+            "  is_bust INTEGER NOT NULL,"
+            "  created_at TEXT NOT NULL"
             ");"
             "CREATE TABLE IF NOT EXISTS aq_oms_transitions ("
             "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -214,6 +258,18 @@ struct NativeOms::Impl {
             "  authority_epoch INTEGER NOT NULL,"
             "  active INTEGER NOT NULL,"
             "  updated_at TEXT NOT NULL"
+            ");"
+            "CREATE TABLE IF NOT EXISTS aq_oms_control_meta ("
+            "  id INTEGER PRIMARY KEY CHECK (id = 1),"
+            "  reason TEXT NOT NULL,"
+            "  updated_at TEXT NOT NULL"
+            ");"
+            "CREATE TABLE IF NOT EXISTS aq_oms_audit_log ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  env TEXT NOT NULL,"
+            "  event_type TEXT NOT NULL,"
+            "  detail TEXT NOT NULL,"
+            "  created_at TEXT NOT NULL"
             ");");
     }
 
@@ -230,6 +286,39 @@ struct NativeOms::Impl {
         std::string ts = now_utc_iso();
         sqlite3_bind_text(st.stmt, 5, ts.c_str(), -1, SQLITE_TRANSIENT);
         if (sqlite3_step(st.stmt) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(db));
+    }
+
+    void record_audit(const std::string& env, const std::string& ev_type, const std::string& detail) {
+        StmtGuard st(db, "INSERT INTO aq_oms_audit_log(env, event_type, detail, created_at) VALUES(?1,?2,?3,?4);");
+        sqlite3_bind_text(st.stmt, 1, env.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st.stmt, 2, ev_type.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st.stmt, 3, detail.c_str(), -1, SQLITE_TRANSIENT);
+        std::string ts = now_utc_iso();
+        sqlite3_bind_text(st.stmt, 4, ts.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st.stmt) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(db));
+    }
+
+    void save_control_reason(const std::string& reason) {
+        StmtGuard st(db,
+            "INSERT INTO aq_oms_control_meta(id, reason, updated_at) VALUES(1,?1,?2) "
+            "ON CONFLICT(id) DO UPDATE SET reason=excluded.reason, updated_at=excluded.updated_at;");
+        sqlite3_bind_text(st.stmt, 1, reason.c_str(), -1, SQLITE_TRANSIENT);
+        std::string ts = now_utc_iso();
+        sqlite3_bind_text(st.stmt, 2, ts.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st.stmt) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(db));
+    }
+
+    std::string load_control_reason() const {
+        StmtGuard st(db, "SELECT reason FROM aq_oms_control_meta WHERE id=1;");
+        if (sqlite3_step(st.stmt) == SQLITE_ROW) {
+            const unsigned char* r = sqlite3_column_text(st.stmt, 0);
+            return r ? reinterpret_cast<const char*>(r) : "";
+        }
+        return "";
+    }
+
+    ControlState get_control_state() {
+        return ControlState{control.is_halted(), control.current_epoch(), load_control_reason()};
     }
 
     OmsAccountView load_account_unlocked(const std::string& env) const {
@@ -297,11 +386,8 @@ struct NativeOms::Impl {
     }
 
     OmsOrderRecord load_order_unlocked(const std::string& cid) const {
-        StmtGuard st(db,
-            "SELECT client_order_id, env, symbol, side, order_type, qty, filled_qty, limit_price_cents,"
-            " reserved_cash_cents, reserved_sell_qty, state, account_revision, control_epoch,"
-            " policy_hash, broker_order_id, reason_mask, last_error "
-            "FROM aq_oms_orders WHERE client_order_id=?1;");
+        std::string sql = std::string(kSelectOrderCols) + "WHERE client_order_id=?1;";
+        StmtGuard st(db, sql.c_str());
         sqlite3_bind_text(st.stmt, 1, cid.c_str(), -1, SQLITE_TRANSIENT);
         if (sqlite3_step(st.stmt) != SQLITE_ROW) {
             throw std::runtime_error("Order not found: " + cid);
@@ -309,20 +395,15 @@ struct NativeOms::Impl {
         return row_to_order(st.stmt);
     }
 
-    bool find_order_unlocked(const std::string& cid, OmsOrderRecord& out) const {
-        StmtGuard st(db,
-            "SELECT client_order_id, env, symbol, side, order_type, qty, filled_qty, limit_price_cents,"
-            " reserved_cash_cents, reserved_sell_qty, state, account_revision, control_epoch,"
-            " policy_hash, broker_order_id, reason_mask, last_error "
-            "FROM aq_oms_orders WHERE client_order_id=?1;");
+    bool find_order_by_scope_unlocked(const std::string& account_id, const std::string& env, const std::string& cid, OmsOrderRecord& out) const {
+        std::string sql = std::string(kSelectOrderCols) + "WHERE client_order_id=?1 AND account_id=?2 AND env=?3;";
+        StmtGuard st(db, sql.c_str());
         sqlite3_bind_text(st.stmt, 1, cid.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st.stmt, 2, account_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st.stmt, 3, env.c_str(), -1, SQLITE_TRANSIENT);
         if (sqlite3_step(st.stmt) != SQLITE_ROW) return false;
         out = row_to_order(st.stmt);
         return true;
-    }
-
-    ControlState get_control_state() {
-        return ControlState{control.is_halted(), control.current_epoch(), last_control_reason};
     }
 
     bool check_lease_unlocked(const std::string& env, const std::string& owner_id, uint64_t epoch) const {
@@ -349,13 +430,51 @@ std::string NativeOms::hash_policy(const aq_risk_policy_t& policy) {
     return sha256_hex(oss.str());
 }
 
-void NativeOms::init_account(const std::string& env, int64_t cash_cents, int64_t equity_cents) {
+std::string NativeOms::canonical_request_hash(
+    const std::string& account_id,
+    const std::string& env,
+    const aq_order_intent_t& intent,
+    const std::string& time_in_force) {
+    std::ostringstream oss;
+    oss << account_id << "|" << env << "|" << intent.symbol << "|"
+        << static_cast<int>(intent.side) << "|" << static_cast<int>(intent.order_type) << "|"
+        << time_in_force << "|" << intent.qty << "|" << intent.price_cents << "|"
+        << intent.stop_cents << "|" << intent.target_cents;
+    return sha256_hex(oss.str());
+}
+
+void NativeOms::seed_account_if_absent(const std::string& env, int64_t cash_cents, int64_t equity_cents) {
     std::lock_guard<std::mutex> lk(impl_->mu);
     TxGuard tx(impl_->db);
     StmtGuard st(impl_->db,
-        "INSERT INTO aq_oms_account(env, cash_cents, equity_cents, account_revision, integrity_ok, daily_pnl_bps, total_drawdown_bps, updated_at) "
-        "VALUES(?1,?2,?3,1,1,0,0,?4) "
-        "ON CONFLICT(env) DO UPDATE SET cash_cents=excluded.cash_cents, equity_cents=excluded.equity_cents, updated_at=excluded.updated_at;");
+        "INSERT OR IGNORE INTO aq_oms_account(env, cash_cents, equity_cents, account_revision, integrity_ok, daily_pnl_bps, total_drawdown_bps, updated_at) "
+        "VALUES(?1,?2,?3,1,1,0,0,?4);");
+    sqlite3_bind_text(st.stmt, 1, env.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st.stmt, 2, cash_cents);
+    sqlite3_bind_int64(st.stmt, 3, equity_cents);
+    std::string ts = now_utc_iso();
+    sqlite3_bind_text(st.stmt, 4, ts.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st.stmt) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(impl_->db));
+    tx.commit();
+}
+
+void NativeOms::reset_account(const std::string& env, int64_t cash_cents, int64_t equity_cents, const std::string& scope_note) {
+    if (scope_note.empty()) throw std::invalid_argument("reset_account requires explicit scope_note");
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    TxGuard tx(impl_->db);
+    OmsAccountView prev = impl_->load_account_unlocked(env);
+    std::ostringstream snap;
+    snap << "scope=" << scope_note << ";prev_cash=" << prev.cash_cents
+         << ";prev_equity=" << prev.equity_cents << ";prev_rev=" << prev.account_revision;
+    impl_->record_audit(env, "EXPLICIT_ACCOUNT_RESET", snap.str());
+
+    StmtGuard del_pos(impl_->db, "DELETE FROM aq_oms_positions WHERE env=?1;");
+    sqlite3_bind_text(del_pos.stmt, 1, env.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(del_pos.stmt) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(impl_->db));
+
+    StmtGuard st(impl_->db,
+        "UPDATE aq_oms_account SET cash_cents=?2, equity_cents=?3, account_revision=account_revision+1, "
+        "integrity_ok=1, daily_pnl_bps=0, total_drawdown_bps=0, updated_at=?4 WHERE env=?1;");
     sqlite3_bind_text(st.stmt, 1, env.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st.stmt, 2, cash_cents);
     sqlite3_bind_int64(st.stmt, 3, equity_cents);
@@ -394,30 +513,91 @@ void NativeOms::set_account_health(const std::string& env, bool integrity_ok, in
     tx.commit();
 }
 
-void NativeOms::acquire_writer_lease(const std::string& env, const std::string& owner_id, uint64_t authority_epoch) {
+bool NativeOms::verify_accounting_consistency(const std::string& env, std::string* out_error) const {
     std::lock_guard<std::mutex> lk(impl_->mu);
-    TxGuard tx(impl_->db);
-    StmtGuard st(impl_->db,
-        "INSERT INTO aq_oms_writer_lease(env, owner_id, authority_epoch, active, updated_at) VALUES(?1,?2,?3,1,?4) "
-        "ON CONFLICT(env) DO UPDATE SET owner_id=excluded.owner_id, authority_epoch=excluded.authority_epoch, active=1, updated_at=excluded.updated_at;");
-    sqlite3_bind_text(st.stmt, 1, env.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st.stmt, 2, owner_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(st.stmt, 3, static_cast<int64_t>(authority_epoch));
-    std::string ts = now_utc_iso();
-    sqlite3_bind_text(st.stmt, 4, ts.c_str(), -1, SQLITE_TRANSIENT);
-    if (sqlite3_step(st.stmt) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(impl_->db));
-    tx.commit();
+    try {
+        OmsAccountView view = impl_->load_account_unlocked(env);
+        if (view.cash_cents < 0) {
+            if (out_error) *out_error = "Negative cash_cents";
+            return false;
+        }
+        if (view.total_reserved_buy_cents > view.cash_cents) {
+            if (out_error) *out_error = "Reserved buy cash exceeds cash_cents";
+            return false;
+        }
+        StmtGuard st(impl_->db,
+            "SELECT client_order_id, qty, filled_qty, reserved_cash_cents, state FROM aq_oms_orders WHERE env=?1;");
+        sqlite3_bind_text(st.stmt, 1, env.c_str(), -1, SQLITE_TRANSIENT);
+        while (sqlite3_step(st.stmt) == SQLITE_ROW) {
+            int64_t qty = sqlite3_column_int64(st.stmt, 1);
+            int64_t filled = sqlite3_column_int64(st.stmt, 2);
+            int64_t rcash = sqlite3_column_int64(st.stmt, 3);
+            OrderState ost = order_state_from_str(reinterpret_cast<const char*>(sqlite3_column_text(st.stmt, 4)));
+            if (filled < 0 || filled > qty || rcash < 0) {
+                if (out_error) *out_error = "Corrupt order fill/reserve bounds";
+                return false;
+            }
+            if (is_terminal_state(ost) && rcash != 0) {
+                if (out_error) *out_error = "Terminal order retains nonzero reservation";
+                return false;
+            }
+        }
+        return true;
+    } catch (const std::exception& e) {
+        if (out_error) *out_error = e.what();
+        return false;
+    }
 }
 
-void NativeOms::revoke_writer_lease(const std::string& env) {
+bool NativeOms::try_acquire_writer_lease(const std::string& env, const std::string& owner_id, uint64_t expected_prev_epoch, uint64_t new_epoch) {
+    if (owner_id.empty() || new_epoch == 0) return false;
     std::lock_guard<std::mutex> lk(impl_->mu);
     TxGuard tx(impl_->db);
-    StmtGuard st(impl_->db, "UPDATE aq_oms_writer_lease SET active=0, updated_at=?2 WHERE env=?1;");
-    sqlite3_bind_text(st.stmt, 1, env.c_str(), -1, SQLITE_TRANSIENT);
+    StmtGuard sel(impl_->db, "SELECT authority_epoch, active FROM aq_oms_writer_lease WHERE env=?1;");
+    sqlite3_bind_text(sel.stmt, 1, env.c_str(), -1, SQLITE_TRANSIENT);
     std::string ts = now_utc_iso();
-    sqlite3_bind_text(st.stmt, 2, ts.c_str(), -1, SQLITE_TRANSIENT);
-    if (sqlite3_step(st.stmt) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(impl_->db));
+    if (sqlite3_step(sel.stmt) != SQLITE_ROW) {
+        if (expected_prev_epoch != 0) return false;
+        StmtGuard ins(impl_->db, "INSERT INTO aq_oms_writer_lease(env, owner_id, authority_epoch, active, updated_at) VALUES(?1,?2,?3,1,?4);");
+        sqlite3_bind_text(ins.stmt, 1, env.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(ins.stmt, 2, owner_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(ins.stmt, 3, static_cast<int64_t>(new_epoch));
+        sqlite3_bind_text(ins.stmt, 4, ts.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(ins.stmt) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(impl_->db));
+        tx.commit();
+        return true;
+    }
+    uint64_t cur_epoch = static_cast<uint64_t>(sqlite3_column_int64(sel.stmt, 0));
+    if (cur_epoch != expected_prev_epoch || new_epoch <= cur_epoch) {
+        return false;
+    }
+    StmtGuard upd(impl_->db,
+        "UPDATE aq_oms_writer_lease SET owner_id=?2, authority_epoch=?3, active=1, updated_at=?4 WHERE env=?1 AND authority_epoch=?5;");
+    sqlite3_bind_text(upd.stmt, 1, env.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(upd.stmt, 2, owner_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(upd.stmt, 3, static_cast<int64_t>(new_epoch));
+    sqlite3_bind_text(upd.stmt, 4, ts.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(upd.stmt, 5, static_cast<int64_t>(expected_prev_epoch));
+    if (sqlite3_step(upd.stmt) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(impl_->db));
+    bool changed = (sqlite3_changes(impl_->db) == 1);
     tx.commit();
+    return changed;
+}
+
+bool NativeOms::release_writer_lease(const std::string& env, const std::string& owner_id, uint64_t current_epoch) {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    TxGuard tx(impl_->db);
+    StmtGuard upd(impl_->db,
+        "UPDATE aq_oms_writer_lease SET active=0, updated_at=?4 WHERE env=?1 AND owner_id=?2 AND authority_epoch=?3;");
+    sqlite3_bind_text(upd.stmt, 1, env.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(upd.stmt, 2, owner_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(upd.stmt, 3, static_cast<int64_t>(current_epoch));
+    std::string ts = now_utc_iso();
+    sqlite3_bind_text(upd.stmt, 4, ts.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(upd.stmt) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(impl_->db));
+    bool changed = (sqlite3_changes(impl_->db) == 1);
+    tx.commit();
+    return changed;
 }
 
 bool NativeOms::has_active_writer_lease(const std::string& env, const std::string& owner_id, uint64_t authority_epoch) const {
@@ -425,14 +605,29 @@ bool NativeOms::has_active_writer_lease(const std::string& env, const std::strin
     return impl_->check_lease_unlocked(env, owner_id, authority_epoch);
 }
 
+WriterLeaseInfo NativeOms::writer_lease_info(const std::string& env) const {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    WriterLeaseInfo info;
+    info.env = env;
+    StmtGuard st(impl_->db, "SELECT owner_id, authority_epoch, active FROM aq_oms_writer_lease WHERE env=?1;");
+    sqlite3_bind_text(st.stmt, 1, env.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st.stmt) == SQLITE_ROW) {
+        info.owner_id = reinterpret_cast<const char*>(sqlite3_column_text(st.stmt, 0));
+        info.authority_epoch = static_cast<uint64_t>(sqlite3_column_int64(st.stmt, 1));
+        info.active = (sqlite3_column_int(st.stmt, 2) == 1);
+    }
+    return info;
+}
+
 ControlState NativeOms::control_state() const {
+    std::lock_guard<std::mutex> lk(impl_->mu);
     return impl_->get_control_state();
 }
 
 HaltResult NativeOms::halt(const std::string& env, const std::string& reason) {
-    uint64_t ep = impl_->control.set_halt(true, reason);
     std::lock_guard<std::mutex> lk(impl_->mu);
-    impl_->last_control_reason = reason;
+    uint64_t ep = impl_->control.set_halt(true, reason);
+    impl_->save_control_reason(reason);
     size_t unknown_cnt = 0;
     StmtGuard st(impl_->db, "SELECT COUNT(*) FROM aq_oms_orders WHERE env=?1 AND state='DISPATCHED_UNKNOWN';");
     sqlite3_bind_text(st.stmt, 1, env.c_str(), -1, SQLITE_TRANSIENT);
@@ -447,9 +642,9 @@ HaltResult NativeOms::halt(const std::string& env, const std::string& reason) {
 }
 
 ControlState NativeOms::resume(const std::string& reason) {
-    uint64_t ep = impl_->control.set_halt(false, reason);
     std::lock_guard<std::mutex> lk(impl_->mu);
-    impl_->last_control_reason = reason;
+    uint64_t ep = impl_->control.set_halt(false, reason);
+    impl_->save_control_reason(reason);
     return ControlState{false, ep, reason};
 }
 
@@ -460,11 +655,8 @@ OmsAccountView NativeOms::account_snapshot(const std::string& env) const {
 
 std::vector<OmsOrderRecord> NativeOms::list_orders(const std::string& env) const {
     std::lock_guard<std::mutex> lk(impl_->mu);
-    StmtGuard st(impl_->db,
-        "SELECT client_order_id, env, symbol, side, order_type, qty, filled_qty, limit_price_cents,"
-        " reserved_cash_cents, reserved_sell_qty, state, account_revision, control_epoch,"
-        " policy_hash, broker_order_id, reason_mask, last_error "
-        "FROM aq_oms_orders WHERE env=?1 ORDER BY rowid DESC;");
+    std::string sql = std::string(kSelectOrderCols) + "WHERE env=?1 ORDER BY rowid DESC;";
+    StmtGuard st(impl_->db, sql.c_str());
     sqlite3_bind_text(st.stmt, 1, env.c_str(), -1, SQLITE_TRANSIENT);
     std::vector<OmsOrderRecord> out;
     while (sqlite3_step(st.stmt) == SQLITE_ROW) {
@@ -484,16 +676,27 @@ OmsSubmitResult NativeOms::submit_intent(
     const aq_instrument_spec_t& spec,
     const aq_order_intent_t& intent,
     const aq_risk_policy_t& policy,
-    int64_t fee_allowance_bps) {
+    int64_t fee_allowance_bps,
+    const std::string& account_id,
+    const std::string& time_in_force) {
     if (client_order_id.empty()) throw std::invalid_argument("client_order_id required");
     if (fee_allowance_bps < 0 || fee_allowance_bps > 1000) throw std::invalid_argument("fee_allowance_bps out of range");
 
-    ControlState cs = impl_->get_control_state();
+    std::string req_hash = canonical_request_hash(account_id, env, intent, time_in_force);
+
     std::lock_guard<std::mutex> lk(impl_->mu);
+    ControlState cs = impl_->get_control_state();
     TxGuard tx(impl_->db);
 
     OmsOrderRecord existing;
-    if (impl_->find_order_unlocked(client_order_id, existing)) {
+    if (impl_->find_order_by_scope_unlocked(account_id, env, client_order_id, existing)) {
+        if (existing.request_hash != req_hash) {
+            OmsSubmitResult conf;
+            conf.conflict = true;
+            conf.order = existing;
+            tx.commit();
+            return conf;
+        }
         OmsSubmitResult dup;
         dup.accepted_for_reservation = is_active_reservation_state(existing.state) || existing.state == OrderState::FILLED;
         dup.duplicate_idempotent = true;
@@ -537,13 +740,7 @@ OmsSubmitResult NativeOms::submit_intent(
     OrderState next_state = OrderState::REJECTED;
     if (st == AQ_OK && dec.approved) {
         if (intent.side == AQ_SIDE_BUY) {
-            int64_t notional = 0;
-            int64_t fee_num = 0;
-            if (aq_checked_mul_i64(intent.qty, intent.price_cents, &notional) != AQ_OK ||
-                aq_checked_mul_i64(notional, fee_allowance_bps, &fee_num) != AQ_OK ||
-                aq_checked_add_i64(notional, (fee_num + 9999) / 10000, &res_cash) != AQ_OK) {
-                throw std::overflow_error("reservation cash overflow");
-            }
+            res_cash = compute_buy_reserve(intent.qty, intent.price_cents, fee_allowance_bps);
             int64_t avail_cash = 0;
             if (aq_checked_sub_i64(view.cash_cents, view.total_reserved_buy_cents, &avail_cash) != AQ_OK) {
                 throw std::overflow_error("avail_cash overflow");
@@ -566,26 +763,34 @@ OmsSubmitResult NativeOms::submit_intent(
     {
         StmtGuard ins(impl_->db,
             "INSERT INTO aq_oms_orders("
-            "client_order_id, env, symbol, side, order_type, qty, filled_qty, limit_price_cents,"
-            "reserved_cash_cents, reserved_sell_qty, state, account_revision, control_epoch,"
-            "policy_hash, broker_order_id, reason_mask, last_error, created_at, updated_at) "
-            "VALUES(?1,?2,?3,?4,?5,?6,0,?7,?8,?9,?10,?11,?12,?13,'',?14,'',?15,?15);");
+            "client_order_id, account_id, env, symbol, side, order_type, time_in_force,"
+            "qty, filled_qty, limit_price_cents, stop_cents, target_cents, fee_allowance_bps,"
+            "reserved_cash_cents, reserved_sell_qty, cumulative_executed_notional_cents,"
+            "cumulative_fees_cents, state, account_revision, control_epoch,"
+            "policy_hash, request_hash, broker_order_id, reason_mask, last_error, created_at, updated_at) "
+            "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,0,?9,?10,?11,?12,?13,?14,0,0,?15,?16,?17,?18,?19,'',?20,'',?21,?21);");
         sqlite3_bind_text(ins.stmt, 1, client_order_id.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(ins.stmt, 2, env.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(ins.stmt, 3, intent.symbol, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(ins.stmt, 4, intent.side);
-        sqlite3_bind_int(ins.stmt, 5, intent.order_type);
-        sqlite3_bind_int64(ins.stmt, 6, intent.qty);
-        sqlite3_bind_int64(ins.stmt, 7, intent.price_cents);
-        sqlite3_bind_int64(ins.stmt, 8, res_cash);
-        sqlite3_bind_int64(ins.stmt, 9, res_sell);
+        sqlite3_bind_text(ins.stmt, 2, account_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(ins.stmt, 3, env.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(ins.stmt, 4, intent.symbol, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(ins.stmt, 5, intent.side);
+        sqlite3_bind_int(ins.stmt, 6, intent.order_type);
+        sqlite3_bind_text(ins.stmt, 7, time_in_force.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(ins.stmt, 8, intent.qty);
+        sqlite3_bind_int64(ins.stmt, 9, intent.price_cents);
+        sqlite3_bind_int64(ins.stmt, 10, intent.stop_cents);
+        sqlite3_bind_int64(ins.stmt, 11, intent.target_cents);
+        sqlite3_bind_int64(ins.stmt, 12, fee_allowance_bps);
+        sqlite3_bind_int64(ins.stmt, 13, res_cash);
+        sqlite3_bind_int64(ins.stmt, 14, res_sell);
         std::string st_str = order_state_to_str(next_state);
-        sqlite3_bind_text(ins.stmt, 10, st_str.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(ins.stmt, 11, static_cast<int64_t>(view.account_revision));
-        sqlite3_bind_int64(ins.stmt, 12, static_cast<int64_t>(cs.control_epoch));
-        sqlite3_bind_text(ins.stmt, 13, phash.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(ins.stmt, 14, static_cast<int64_t>(dec.reason_mask));
-        sqlite3_bind_text(ins.stmt, 15, ts.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(ins.stmt, 15, st_str.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(ins.stmt, 16, static_cast<int64_t>(view.account_revision));
+        sqlite3_bind_int64(ins.stmt, 17, static_cast<int64_t>(cs.control_epoch));
+        sqlite3_bind_text(ins.stmt, 18, phash.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(ins.stmt, 19, req_hash.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(ins.stmt, 20, static_cast<int64_t>(dec.reason_mask));
+        sqlite3_bind_text(ins.stmt, 21, ts.c_str(), -1, SQLITE_TRANSIENT);
         if (sqlite3_step(ins.stmt) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(impl_->db));
     }
     impl_->record_transition(client_order_id, "VALIDATED", order_state_to_str(next_state),
@@ -616,12 +821,12 @@ OmsOrderRecord NativeOms::dispatch_reserved(
     const aq_risk_policy_t& current_policy,
     const RemoteDispatchFn& transport,
     bool simulate_crash_before_transport) {
-    ControlState cs = impl_->get_control_state();
     std::string cur_phash = hash_policy(current_policy);
     OmsOrderRecord order_copy;
 
     {
         std::lock_guard<std::mutex> lk(impl_->mu);
+        ControlState cs = impl_->get_control_state();
         TxGuard tx(impl_->db);
         if (!impl_->check_lease_unlocked(env, writer_owner_id, writer_epoch)) {
             throw std::runtime_error("DISPATCH_BLOCKED_NO_LEASE");
@@ -651,7 +856,6 @@ OmsOrderRecord NativeOms::dispatch_reserved(
             return order_copy;
         }
 
-        // Persist PENDING_DISPATCH -> DISPATCHED_UNKNOWN durably BEFORE remote transport!
         StmtGuard upd(impl_->db, "UPDATE aq_oms_orders SET state='DISPATCHED_UNKNOWN', updated_at=?2 WHERE client_order_id=?1;");
         sqlite3_bind_text(upd.stmt, 1, client_order_id.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(upd.stmt, 2, ts.c_str(), -1, SQLITE_TRANSIENT);
@@ -674,71 +878,125 @@ OmsOrderRecord NativeOms::dispatch_reserved(
 }
 
 OmsOrderRecord NativeOms::reconcile_order(const std::string& client_order_id, const DispatchOutcome& outcome) {
+    if (outcome.filled_qty < 0 || outcome.avg_fill_price_cents < 0 || outcome.fee_cents < 0) {
+        throw std::invalid_argument("Negative execution quantities/prices/fees rejected");
+    }
+
     std::lock_guard<std::mutex> lk(impl_->mu);
     TxGuard tx(impl_->db);
     OmsOrderRecord cur = impl_->load_order_unlocked(client_order_id);
-    if (is_terminal_state(cur.state)) {
+
+    // R3: Exact execution ID deduplication.
+    if (!outcome.exec_id.empty()) {
+        StmtGuard chk(impl_->db, "SELECT 1 FROM aq_oms_executions WHERE exec_id=?1;");
+        sqlite3_bind_text(chk.stmt, 1, outcome.exec_id.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(chk.stmt) == SQLITE_ROW) {
+            tx.commit();
+            return cur;
+        }
+    }
+
+    std::string ts = now_utc_iso();
+
+    // R3: Handle bust/correction or over-fill conflict by halting and recording conflict without inventing state.
+    if (outcome.is_bust || (outcome.is_cumulative && outcome.filled_qty > cur.qty)) {
+        impl_->control.set_halt(true, "EXECUTION_CONFLICT_OR_BUST");
+        impl_->save_control_reason("EXECUTION_CONFLICT_OR_BUST");
+        impl_->record_audit(cur.env, "EXECUTION_CONFLICT", "cid=" + client_order_id + ";detail=" + outcome.detail);
         tx.commit();
         return cur;
     }
 
-    std::string ts = now_utc_iso();
-    OrderState next_st = outcome.remote_state;
-    int64_t new_filled = cur.filled_qty;
-    int64_t new_res_cash = cur.reserved_cash_cents;
-    int64_t new_res_sell = cur.reserved_sell_qty;
+    // R3: Out-of-order stale cumulative update must NOT roll back filled_qty or release active reserve.
+    if (outcome.is_cumulative && outcome.filled_qty > 0 && outcome.filled_qty < cur.filled_qty) {
+        impl_->record_audit(cur.env, "STALE_CUMULATIVE_IGNORED", "cid=" + client_order_id);
+        tx.commit();
+        return cur;
+    }
 
-    if (next_st == OrderState::FILLED || next_st == OrderState::PARTIAL) {
-        int64_t target_filled = std::min(cur.qty, std::max(cur.filled_qty, outcome.filled_qty));
-        int64_t delta_fill = target_filled - cur.filled_qty;
-        new_filled = target_filled;
-        if (new_filled >= cur.qty) next_st = OrderState::FILLED;
+    int64_t delta_fill = 0;
+    int64_t delta_notional = 0;
+    int64_t new_filled = cur.filled_qty;
+    int64_t new_cum_notional = cur.cumulative_executed_notional_cents;
+
+    if (outcome.filled_qty > 0) {
+        if (outcome.is_cumulative) {
+            int64_t target_filled = std::min(cur.qty, outcome.filled_qty);
+            delta_fill = target_filled - cur.filled_qty;
+            if (delta_fill > 0) {
+                int64_t target_cum_notional = 0;
+                if (aq_checked_mul_i64(target_filled, outcome.avg_fill_price_cents, &target_cum_notional) != AQ_OK ||
+                    aq_checked_sub_i64(target_cum_notional, cur.cumulative_executed_notional_cents, &delta_notional) != AQ_OK) {
+                    throw std::overflow_error("cumulative notional delta overflow");
+                }
+                new_filled = target_filled;
+                new_cum_notional = target_cum_notional;
+            }
+        } else {
+            if (aq_checked_add_i64(cur.filled_qty, outcome.filled_qty, &new_filled) != AQ_OK ||
+                new_filled > cur.qty) {
+                impl_->control.set_halt(true, "INCREMENTAL_OVERFILL_CONFLICT");
+                impl_->save_control_reason("INCREMENTAL_OVERFILL_CONFLICT");
+                impl_->record_audit(cur.env, "OVERFILL_CONFLICT", "cid=" + client_order_id);
+                tx.commit();
+                return cur;
+            }
+            delta_fill = outcome.filled_qty;
+            if (aq_checked_mul_i64(delta_fill, outcome.avg_fill_price_cents, &delta_notional) != AQ_OK ||
+                aq_checked_add_i64(cur.cumulative_executed_notional_cents, delta_notional, &new_cum_notional) != AQ_OK) {
+                throw std::overflow_error("incremental notional overflow");
+            }
+        }
+    }
+
+    if (delta_fill > 0 || outcome.fee_cents > 0) {
+        if (!outcome.exec_id.empty()) {
+            StmtGuard ins_ex(impl_->db,
+                "INSERT INTO aq_oms_executions(exec_id, client_order_id, exec_qty, exec_price_cents, fee_cents, is_bust, created_at) "
+                "VALUES(?1,?2,?3,?4,?5,0,?6);");
+            sqlite3_bind_text(ins_ex.stmt, 1, outcome.exec_id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(ins_ex.stmt, 2, client_order_id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(ins_ex.stmt, 3, delta_fill);
+            sqlite3_bind_int64(ins_ex.stmt, 4, outcome.avg_fill_price_cents);
+            sqlite3_bind_int64(ins_ex.stmt, 5, outcome.fee_cents);
+            sqlite3_bind_text(ins_ex.stmt, 6, ts.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(ins_ex.stmt) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(impl_->db));
+        }
+
+        OmsAccountView view = impl_->load_account_unlocked(cur.env);
+        int64_t cur_pos_qty = 0;
+        for (const auto& p : view.positions) {
+            if (std::strncmp(p.symbol, cur.symbol.c_str(), AQ_MAX_SYMBOL_LEN) == 0) {
+                cur_pos_qty = p.qty;
+                break;
+            }
+        }
+        int64_t new_cash = view.cash_cents;
+        int64_t new_pos_qty = cur_pos_qty;
+        if (cur.side == AQ_SIDE_BUY) {
+            int64_t total_spend = 0;
+            if (aq_checked_add_i64(delta_notional, outcome.fee_cents, &total_spend) != AQ_OK ||
+                aq_checked_sub_i64(new_cash, total_spend, &new_cash) != AQ_OK ||
+                aq_checked_add_i64(new_pos_qty, delta_fill, &new_pos_qty) != AQ_OK) {
+                throw std::overflow_error("buy settlement overflow");
+            }
+        } else {
+            int64_t net_proc = 0;
+            if (aq_checked_sub_i64(delta_notional, outcome.fee_cents, &net_proc) != AQ_OK ||
+                aq_checked_add_i64(new_cash, net_proc, &new_cash) != AQ_OK ||
+                aq_checked_sub_i64(new_pos_qty, delta_fill, &new_pos_qty) != AQ_OK) {
+                throw std::overflow_error("sell settlement overflow");
+            }
+        }
+
+        StmtGuard up_acc(impl_->db,
+            "UPDATE aq_oms_account SET cash_cents=?2, account_revision=account_revision+1, updated_at=?3 WHERE env=?1;");
+        sqlite3_bind_text(up_acc.stmt, 1, cur.env.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(up_acc.stmt, 2, new_cash);
+        sqlite3_bind_text(up_acc.stmt, 3, ts.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(up_acc.stmt) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(impl_->db));
 
         if (delta_fill > 0) {
-            int64_t fill_notional = 0;
-            if (aq_checked_mul_i64(delta_fill, outcome.avg_fill_price_cents, &fill_notional) != AQ_OK) {
-                throw std::overflow_error("fill_notional overflow");
-            }
-            OmsAccountView view = impl_->load_account_unlocked(cur.env);
-            int64_t cur_pos_qty = 0;
-            for (const auto& p : view.positions) {
-                if (std::strncmp(p.symbol, cur.symbol.c_str(), AQ_MAX_SYMBOL_LEN) == 0) {
-                    cur_pos_qty = p.qty;
-                    break;
-                }
-            }
-            int64_t new_cash = view.cash_cents;
-            int64_t new_pos_qty = cur_pos_qty;
-            if (cur.side == AQ_SIDE_BUY) {
-                int64_t total_spend = 0;
-                if (aq_checked_add_i64(fill_notional, outcome.fee_cents, &total_spend) != AQ_OK ||
-                    aq_checked_sub_i64(new_cash, total_spend, &new_cash) != AQ_OK ||
-                    aq_checked_add_i64(new_pos_qty, delta_fill, &new_pos_qty) != AQ_OK) {
-                    throw std::overflow_error("buy settlement overflow");
-                }
-                if (next_st == OrderState::FILLED) {
-                    new_res_cash = 0;
-                } else {
-                    int64_t rem = cur.qty - new_filled;
-                    new_res_cash = (cur.reserved_cash_cents * rem) / std::max<int64_t>(1, cur.qty);
-                }
-            } else {
-                int64_t net_proc = 0;
-                if (aq_checked_sub_i64(fill_notional, outcome.fee_cents, &net_proc) != AQ_OK ||
-                    aq_checked_add_i64(new_cash, net_proc, &new_cash) != AQ_OK ||
-                    aq_checked_sub_i64(new_pos_qty, delta_fill, &new_pos_qty) != AQ_OK) {
-                    throw std::overflow_error("sell settlement overflow");
-                }
-                new_res_sell = (next_st == OrderState::FILLED) ? 0 : (cur.qty - new_filled);
-            }
-
-            StmtGuard up_acc(impl_->db,
-                "UPDATE aq_oms_account SET cash_cents=?2, account_revision=account_revision+1, updated_at=?3 WHERE env=?1;");
-            sqlite3_bind_text(up_acc.stmt, 1, cur.env.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int64(up_acc.stmt, 2, new_cash);
-            sqlite3_bind_text(up_acc.stmt, 3, ts.c_str(), -1, SQLITE_TRANSIENT);
-            if (sqlite3_step(up_acc.stmt) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(impl_->db));
-
             StmtGuard up_pos(impl_->db,
                 "INSERT INTO aq_oms_positions(env, symbol, qty, mark_cents) VALUES(?1,?2,?3,?4) "
                 "ON CONFLICT(env, symbol) DO UPDATE SET qty=excluded.qty, mark_cents=excluded.mark_cents;");
@@ -748,14 +1006,36 @@ OmsOrderRecord NativeOms::reconcile_order(const std::string& client_order_id, co
             sqlite3_bind_int64(up_pos.stmt, 4, outcome.avg_fill_price_cents > 0 ? outcome.avg_fill_price_cents : cur.limit_price_cents);
             if (sqlite3_step(up_pos.stmt) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(impl_->db));
         }
-    } else if (next_st == OrderState::REJECTED || next_st == OrderState::CANCELLED || next_st == OrderState::EXPIRED) {
-        new_res_cash = 0;
-        new_res_sell = 0;
+    }
+
+    OrderState next_st = outcome.remote_state;
+    if (new_filled >= cur.qty) {
+        next_st = OrderState::FILLED;
+    } else if (is_terminal_state(cur.state) && delta_fill == 0) {
+        next_st = cur.state;
+    }
+
+    // R3: Direct remaining-obligation reservation computation (never recursive rescaling!).
+    int64_t rem_qty = std::max<int64_t>(0, cur.qty - new_filled);
+    int64_t new_res_cash = 0;
+    int64_t new_res_sell = 0;
+    if (!is_terminal_state(next_st) && rem_qty > 0) {
+        if (cur.side == AQ_SIDE_BUY) {
+            new_res_cash = compute_buy_reserve(rem_qty, cur.limit_price_cents, cur.fee_allowance_bps);
+        } else {
+            new_res_sell = rem_qty;
+        }
+    }
+
+    int64_t new_cum_fees = 0;
+    if (aq_checked_add_i64(cur.cumulative_fees_cents, outcome.fee_cents, &new_cum_fees) != AQ_OK) {
+        throw std::overflow_error("cumulative fees overflow");
     }
 
     StmtGuard upd(impl_->db,
         "UPDATE aq_oms_orders SET state=?2, filled_qty=?3, reserved_cash_cents=?4, reserved_sell_qty=?5,"
-        " broker_order_id=CASE WHEN ?6<>'' THEN ?6 ELSE broker_order_id END, last_error=?7, updated_at=?8 "
+        " cumulative_executed_notional_cents=?6, cumulative_fees_cents=?7,"
+        " broker_order_id=CASE WHEN ?8<>'' THEN ?8 ELSE broker_order_id END, last_error=?9, updated_at=?10 "
         "WHERE client_order_id=?1;");
     sqlite3_bind_text(upd.stmt, 1, client_order_id.c_str(), -1, SQLITE_TRANSIENT);
     std::string nst = order_state_to_str(next_st);
@@ -763,9 +1043,11 @@ OmsOrderRecord NativeOms::reconcile_order(const std::string& client_order_id, co
     sqlite3_bind_int64(upd.stmt, 3, new_filled);
     sqlite3_bind_int64(upd.stmt, 4, new_res_cash);
     sqlite3_bind_int64(upd.stmt, 5, new_res_sell);
-    sqlite3_bind_text(upd.stmt, 6, outcome.broker_order_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(upd.stmt, 7, outcome.detail.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(upd.stmt, 8, ts.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(upd.stmt, 6, new_cum_notional);
+    sqlite3_bind_int64(upd.stmt, 7, new_cum_fees);
+    sqlite3_bind_text(upd.stmt, 8, outcome.broker_order_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(upd.stmt, 9, outcome.detail.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(upd.stmt, 10, ts.c_str(), -1, SQLITE_TRANSIENT);
     if (sqlite3_step(upd.stmt) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(impl_->db));
 
     impl_->record_transition(client_order_id, order_state_to_str(cur.state), nst, outcome.detail);
@@ -800,11 +1082,9 @@ OmsOrderRecord NativeOms::request_cancel(const std::string& client_order_id) {
 
 std::vector<OmsOrderRecord> NativeOms::recover_in_flight(const std::string& env) const {
     std::lock_guard<std::mutex> lk(impl_->mu);
-    StmtGuard st(impl_->db,
-        "SELECT client_order_id, env, symbol, side, order_type, qty, filled_qty, limit_price_cents,"
-        " reserved_cash_cents, reserved_sell_qty, state, account_revision, control_epoch,"
-        " policy_hash, broker_order_id, reason_mask, last_error "
-        "FROM aq_oms_orders WHERE env=?1 AND state IN ('PENDING_DISPATCH','DISPATCHED_UNKNOWN','CANCEL_PENDING') ORDER BY rowid;");
+    std::string sql = std::string(kSelectOrderCols) +
+                      "WHERE env=?1 AND state IN ('PENDING_DISPATCH','DISPATCHED_UNKNOWN','CANCEL_PENDING') ORDER BY rowid;";
+    StmtGuard st(impl_->db, sql.c_str());
     sqlite3_bind_text(st.stmt, 1, env.c_str(), -1, SQLITE_TRANSIENT);
     std::vector<OmsOrderRecord> out;
     while (sqlite3_step(st.stmt) == SQLITE_ROW) {

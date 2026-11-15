@@ -1,26 +1,33 @@
 #include "aq/service.hpp"
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
+#include <boost/asio.hpp>
+#include <boost/beast/core.hpp>
+#include <boost/beast/http.hpp>
 #include <openssl/crypto.h>
 #include <openssl/rand.h>
-#include <sys/socket.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <iomanip>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 
 namespace aq {
 
+namespace beast = boost::beast;
+namespace http = beast::http;
+namespace net = boost::asio;
+using tcp = net::ip::tcp;
+
 namespace {
 
 constexpr size_t kMaxHttpBodyBytes = 1024 * 1024;
+constexpr size_t kMaxHttpHeaderBytes = 16384;
 
 std::string to_lower(std::string s) {
     for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -65,68 +72,199 @@ std::string extract_cookie(const std::string& cookie_hdr, const std::string& nam
     return "";
 }
 
-std::string json_str_field(const std::string& body, const std::string& key) {
-    std::string pat = "\"" + key + "\"";
-    size_t pos = body.find(pat);
-    if (pos == std::string::npos) return "";
-    pos = body.find(':', pos + pat.size());
-    if (pos == std::string::npos) return "";
-    size_t q1 = body.find('"', pos + 1);
-    if (q1 == std::string::npos) return "";
-    size_t q2 = body.find('"', q1 + 1);
-    if (q2 == std::string::npos) return "";
-    return body.substr(q1 + 1, q2 - q1 - 1);
-}
-
-int64_t json_i64_field(const std::string& body, const std::string& key, int64_t fallback) {
-    std::string pat = "\"" + key + "\"";
-    size_t pos = body.find(pat);
-    if (pos == std::string::npos) return fallback;
-    pos = body.find(':', pos + pat.size());
-    if (pos == std::string::npos) return fallback;
-    pos += 1;
-    while (pos < body.size() && (body[pos] == ' ' || body[pos] == '\t')) pos++;
-    try {
-        size_t idx = 0;
-        long long v = std::stoll(body.substr(pos), &idx, 10);
-        if (idx == 0) return fallback;
-        return static_cast<int64_t>(v);
-    } catch (...) {
-        return fallback;
-    }
-}
-
 int64_t now_epoch_s() {
     return std::chrono::duration_cast<std::chrono::seconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
 }
 
+std::string reason_text(int code) {
+    switch (code) {
+        case 200: return "OK";
+        case 400: return "Bad Request";
+        case 401: return "Unauthorized";
+        case 404: return "Not Found";
+        case 409: return "Conflict";
+        case 413: return "Payload Too Large";
+        case 422: return "Unprocessable Entity";
+        case 429: return "Too Many Requests";
+        default: return "Internal Server Error";
+    }
+}
+
 }  // namespace
 
-ShadowComparisonReport run_shadow_parity_check(
+ReplayRepeatabilityReport run_replay_repeatability_check(
     const Dataset& ds,
     const SimConfig& scfg,
     const ActorCritic* model_or_null,
     const std::string& model_hash) {
     auto r1 = run_replay_episode(ds, model_or_null, model_hash, scfg);
     auto r2 = run_replay_episode(ds, model_or_null, model_hash, scfg);
-    ShadowComparisonReport rep;
-    rep.ref_final_equity_cents = r1.final_equity_cents;
-    rep.native_final_equity_cents = r2.final_equity_cents;
-    rep.ref_risk_interventions = r1.risk_interventions;
-    rep.native_risk_interventions = r2.risk_interventions;
+    ReplayRepeatabilityReport rep;
+    rep.final_equity_cents = r1.final_equity_cents;
     rep.steps_compared = r1.steps;
-    rep.ref_receipt_hash = r1.receipt_hash;
-    rep.native_receipt_hash = r2.receipt_hash;
-    rep.exact_accounting_parity = (r1.final_cash_cents == r2.final_cash_cents &&
-                                   r1.final_shares == r2.final_shares &&
-                                   r1.final_equity_cents == r2.final_equity_cents);
-    rep.exact_verdict_parity = (r1.risk_interventions == r2.risk_interventions &&
-                                r1.trades_executed == r2.trades_executed &&
-                                r1.receipt_hash == r2.receipt_hash);
+    rep.receipt_hash = r1.receipt_hash;
+    rep.exact_repeatability = (r1.final_cash_cents == r2.final_cash_cents &&
+                               r1.final_shares == r2.final_shares &&
+                               r1.final_equity_cents == r2.final_equity_cents &&
+                               r1.risk_interventions == r2.risk_interventions &&
+                               r1.trades_executed == r2.trades_executed &&
+                               r1.receipt_hash == r2.receipt_hash);
     return rep;
 }
+
+IndependentParityReport run_independent_shadow_parity(
+    const Dataset& ds,
+    const SimConfig& scfg,
+    const std::vector<uint32_t>& action_tape,
+    ParityMutation fault) {
+    IndependentParityReport rep;
+    if (ds.bars.size() < scfg.warmup_bars + 2) {
+        throw std::invalid_argument("Dataset too short for shadow parity");
+    }
+
+    // Candidate runner: real CausalEnv + C17 aq_evaluate_risk
+    CausalEnv env(ds, scfg);
+    env.reset(scfg.warmup_bars);
+
+    // Independent specification oracle (pure integer cents, does not call CausalEnv or aq_evaluate_risk)
+    int64_t ref_cash = scfg.initial_cash_cents;
+    int64_t ref_shares = 0;
+    int64_t ref_peak = scfg.initial_cash_cents;
+    int64_t ref_day = ds.bars[scfg.warmup_bars].close_epoch_s / 86400;
+    int64_t ref_day_start = scfg.initial_cash_cents;
+    double ref_prev_dd = 0.0;
+    bool fault_injected = false;
+    static constexpr double kTargets[3] = {0.0, 0.25, 0.50};
+
+    size_t max_steps = std::min(action_tape.size(), ds.bars.size() - scfg.warmup_bars - 1);
+    for (size_t step = 0; step < max_steps; ++step) {
+        size_t idx = scfg.warmup_bars + step;
+        uint32_t act = action_tape[step];
+        if (fault == ParityMutation::MUTATE_EVENT_ORDER && step + 1 < max_steps) {
+            // Deliberately swap bar/action order on step 0 as negative control
+            if (step == 0) act = (act + 1) % 3;
+        }
+
+        StepOutcome cand = env.step(action_tape[step]);
+
+        int64_t ref_eq_now = ref_cash + ref_shares * ds.bars[idx].close_cents;
+        int64_t bar_day = ds.bars[idx].close_epoch_s / 86400;
+        if (bar_day != ref_day) {
+            ref_day = bar_day;
+            ref_day_start = ref_eq_now;
+        }
+        int64_t px_close = ds.bars[idx].close_cents;
+        int64_t target_shares = static_cast<int64_t>(std::floor((static_cast<double>(ref_eq_now) * kTargets[act]) / static_cast<double>(px_close)));
+        int64_t delta_shares = target_shares - ref_shares;
+
+        bool ref_rejected = false;
+        int64_t ref_exec_delta = 0;
+        if (delta_shares != 0) {
+            int64_t abs_d = delta_shares > 0 ? delta_shares : -delta_shares;
+            int64_t daily_bps = ((ref_eq_now - ref_day_start) * 10000) / std::max<int64_t>(1, ref_day_start);
+            int64_t dd_bps = static_cast<int64_t>(std::llround(ref_prev_dd * 10000.0));
+            bool is_rr = (delta_shares < 0 && ref_shares >= abs_d);
+            bool pre_ok = true;
+            if (!is_rr) {
+                if (scfg.halted) pre_ok = false;
+                if (daily_bps <= -scfg.risk_policy.max_daily_loss_bps) pre_ok = false;
+                if (dd_bps >= scfg.risk_policy.max_total_loss_bps) pre_ok = false;
+                int64_t pre_notional = abs_d * px_close;
+                if (delta_shares > 0 && pre_notional > ref_cash) pre_ok = false;
+                if (pre_notional * 10000 > ref_eq_now * scfg.risk_policy.max_order_notional_bps) pre_ok = false;
+                int64_t next_sym = (ref_shares * px_close) + pre_notional;
+                if (delta_shares > 0 && next_sym * 10000 > ref_eq_now * scfg.risk_policy.max_concentration_bps) pre_ok = false;
+                if (delta_shares > 0 && next_sym * 10000 > ref_eq_now * scfg.risk_policy.max_gross_exposure_bps) pre_ok = false;
+            }
+            if (fault == ParityMutation::MUTATE_VERDICT && !fault_injected) {
+                pre_ok = !pre_ok;
+                fault_injected = true;
+            }
+            if (!pre_ok) {
+                ref_rejected = true;
+            } else {
+                int64_t raw_open = ds.bars[idx + 1].open_cents;
+                int64_t adv_bps = scfg.half_spread_bps + scfg.slippage_bps;
+                int64_t fill_px = delta_shares > 0
+                    ? (raw_open * (10000 + adv_bps) + 9999) / 10000
+                    : (raw_open * (10000 - adv_bps)) / 10000;
+                int64_t notional = abs_d * fill_px;
+                int64_t fee = (notional * scfg.commission_bps + 9999) / 10000;
+                if (fault == ParityMutation::MUTATE_FEE && !fault_injected) {
+                    fee += 100;
+                    fault_injected = true;
+                }
+                if (delta_shares > 0) {
+                    bool exec_ok = (notional + fee <= ref_cash) &&
+                                   (notional * 10000 <= ref_eq_now * scfg.risk_policy.max_order_notional_bps) &&
+                                   (((ref_shares * px_close) + notional) * 10000 <= ref_eq_now * scfg.risk_policy.max_concentration_bps) &&
+                                   (((ref_shares * px_close) + notional) * 10000 <= ref_eq_now * scfg.risk_policy.max_gross_exposure_bps);
+                    if (exec_ok) {
+                        ref_cash -= (notional + fee);
+                        ref_shares += abs_d;
+                        ref_exec_delta = abs_d;
+                    } else {
+                        ref_rejected = true;
+                    }
+                } else {
+                    ref_cash += (notional - fee);
+                    ref_shares -= abs_d;
+                    ref_exec_delta = -abs_d;
+                }
+            }
+        }
+        int64_t ref_eq_next = ref_cash + ref_shares * ds.bars[idx + 1].close_cents;
+        if (ref_eq_next > ref_peak) ref_peak = ref_eq_next;
+        ref_prev_dd = std::max(0.0, static_cast<double>(ref_peak - ref_eq_next) / static_cast<double>(std::max<int64_t>(1, ref_peak)));
+
+        rep.events_compared += 1;
+        if (cand.risk_rejected != ref_rejected) {
+            rep.first_divergence_step = step;
+            rep.first_divergence_field = "risk_rejected";
+            rep.detail = "Verdict mismatch";
+            rep.ref_final_equity_cents = ref_eq_next;
+            rep.native_final_equity_cents = cand.equity_cents;
+            return rep;
+        }
+        if (cand.executed_shares_delta != ref_exec_delta) {
+            rep.first_divergence_step = step;
+            rep.first_divergence_field = "executed_shares_delta";
+            rep.detail = "Executed delta mismatch";
+            rep.ref_final_equity_cents = ref_eq_next;
+            rep.native_final_equity_cents = cand.equity_cents;
+            return rep;
+        }
+        if (cand.cash_cents != ref_cash || cand.shares != ref_shares || cand.equity_cents != ref_eq_next) {
+            rep.first_divergence_step = step;
+            rep.first_divergence_field = (cand.cash_cents != ref_cash) ? "cash_cents" : ((cand.shares != ref_shares) ? "shares" : "equity_cents");
+            rep.detail = "Ledger accounting mismatch";
+            rep.ref_final_equity_cents = ref_eq_next;
+            rep.native_final_equity_cents = cand.equity_cents;
+            return rep;
+        }
+        rep.ref_final_equity_cents = ref_eq_next;
+        rep.native_final_equity_cents = cand.equity_cents;
+    }
+
+    rep.exact_per_event_parity = true;
+    return rep;
+}
+
+struct NativeHttpServer::NetImpl {
+    net::io_context ioc{1};
+    tcp::acceptor acceptor{ioc};
+    std::thread io_thread;
+
+    explicit NetImpl(const std::string& host, uint16_t port) {
+        tcp::endpoint ep(net::ip::make_address(host), port);
+        acceptor.open(ep.protocol());
+        acceptor.set_option(net::socket_base::reuse_address(true));
+        acceptor.bind(ep);
+        acceptor.listen(net::socket_base::max_listen_connections);
+    }
+};
 
 NativeHttpServer::NativeHttpServer(ServiceConfig cfg)
     : cfg_(std::move(cfg)), oms_(cfg_.db_path) {
@@ -135,16 +273,69 @@ NativeHttpServer::NativeHttpServer(ServiceConfig cfg)
     policy_.max_concentration_bps = 3500;
     policy_.max_daily_loss_bps = 500;
     policy_.max_total_loss_bps = 1000;
-    oms_.init_account(cfg_.env, 10000000, 10000000);
+
+    // R1: Non-destructive create-if-absent seed. Never overwrites existing balances.
+    oms_.seed_account_if_absent(cfg_.env, 10000000, 10000000);
+
+    // R1/R4: Only acquire writer lease when explicitly enabled; read-only observer NEVER revokes another owner's lease!
     if (cfg_.enable_paper_writer) {
-        oms_.acquire_writer_lease(cfg_.env, cfg_.writer_owner_id, cfg_.writer_epoch);
-    } else {
-        oms_.revoke_writer_lease(cfg_.env);
+        auto info = oms_.writer_lease_info(cfg_.env);
+        uint64_t next_epoch = info.authority_epoch + 1;
+        oms_.try_acquire_writer_lease(cfg_.env, cfg_.writer_owner_id, info.authority_epoch, next_epoch);
+        cfg_.writer_epoch = next_epoch;
     }
+
+    worker_thread_ = std::thread(&NativeHttpServer::worker_loop, this);
 }
 
 NativeHttpServer::~NativeHttpServer() {
     stop();
+    worker_stop_.store(true);
+    jobs_cv_.notify_all();
+    if (worker_thread_.joinable()) worker_thread_.join();
+}
+
+void NativeHttpServer::worker_loop() {
+    while (true) {
+        std::shared_ptr<TrainingJobInfo> job;
+        {
+            std::unique_lock<std::mutex> lk(jobs_mu_);
+            jobs_cv_.wait(lk, [&]() { return worker_stop_.load() || !job_queue_.empty(); });
+            if (worker_stop_.load() && job_queue_.empty()) break;
+            job = job_queue_.front();
+            job_queue_.pop_front();
+        }
+        if (job->cancel_requested.load()) {
+            std::lock_guard<std::mutex> lk(jobs_mu_);
+            job->status = "CANCELLED";
+            continue;
+        }
+        {
+            std::lock_guard<std::mutex> lk(jobs_mu_);
+            job->status = "RUNNING";
+        }
+        try {
+            Dataset ds_copy;
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                ds_copy = dataset_;
+            }
+            TrainConfig tcfg;
+            tcfg.seed = job->seed;
+            tcfg.updates = job->updates;
+            tcfg.rollout_steps = 32;
+            std::string out_dir = cfg_.db_path + ".jobs/" + job->job_id;
+            auto sum = train_ppo(ds_copy, out_dir, tcfg);
+            std::lock_guard<std::mutex> lk(jobs_mu_);
+            job->status = job->cancel_requested.load() ? "CANCELLED" : "COMPLETED";
+            job->checkpoint_hash = sum.checkpoint_hash;
+            job->eval_equity_usd = sum.final_eval_equity_usd;
+        } catch (const std::exception& e) {
+            std::lock_guard<std::mutex> lk(jobs_mu_);
+            job->status = "FAILED";
+            job->error = e.what();
+        }
+    }
 }
 
 void NativeHttpServer::load_dataset(Dataset ds) {
@@ -156,6 +347,11 @@ void NativeHttpServer::load_dataset(Dataset ds) {
 void NativeHttpServer::set_policy(const aq_risk_policy_t& policy) {
     std::lock_guard<std::mutex> lk(mu_);
     policy_ = policy;
+}
+
+void NativeHttpServer::set_override_now_epoch_s(int64_t epoch_s) {
+    std::lock_guard<std::mutex> lk(mu_);
+    cfg_.override_now_epoch_s = epoch_s;
 }
 
 std::string NativeHttpServer::json_escape(const std::string& s) const {
@@ -213,19 +409,35 @@ HttpResponse NativeHttpServer::handle_request(const HttpRequest& req) {
             std::lock_guard<std::mutex> lk(mu_);
             ds_ok = dataset_loaded_;
         }
-        bool lease_ok = oms_.has_active_writer_lease(cfg_.env, cfg_.writer_owner_id, cfg_.writer_epoch);
+        std::string acct_err;
+        bool acct_ok = oms_.verify_accounting_consistency(cfg_.env, &acct_err);
+        auto lease = oms_.writer_lease_info(cfg_.env);
         auto in_flight = oms_.recover_in_flight(cfg_.env);
         std::ostringstream oss;
         oss << "{\"process\":\"ok\",\"backend\":\"native_cpp\",\"data_mode\":\"" << json_escape(cfg_.data_namespace)
             << "\",\"execution_mode\":\"" << json_escape(cfg_.env)
             << "\",\"live_execution\":false,\"dataset_loaded\":" << (ds_ok ? "true" : "false")
-            << ",\"writer_lease_active\":" << (lease_ok ? "true" : "false")
+            << ",\"accounting_consistent\":" << (acct_ok ? "true" : "false")
+            << ",\"writer_lease_active\":" << (lease.active ? "true" : "false")
             << ",\"in_flight_unknown\":" << in_flight.size()
             << ",\"abi_version\":" << AQ_CORE_ABI_VERSION << "}";
-        return {200, "application/json", {}, oss.str()};
+        return {acct_ok ? 200 : 503, "application/json", {}, oss.str()};
     }
 
     if (m == "POST" && p == "/api/login") {
+        JsonValue j;
+        try {
+            j = parse_json_strict(req.body);
+            if (!j.is_object()) return {400, "application/json", {}, "{\"detail\":\"Expected JSON object\"}"};
+        } catch (const std::exception& e) {
+            return {400, "application/json", {}, "{\"detail\":\"" + json_escape(e.what()) + "\"}"};
+        }
+        const auto& obj = j.as_object();
+        auto it = obj.find("token");
+        if (it == obj.end() || !it->second.is_string()) {
+            return {400, "application/json", {}, "{\"detail\":\"Missing string token\"}"};
+        }
+
         int64_t now = now_epoch_s();
         {
             std::lock_guard<std::mutex> lk(mu_);
@@ -236,8 +448,7 @@ HttpResponse NativeHttpServer::handle_request(const HttpRequest& req) {
             }
             att.push_back(now);
         }
-        std::string tok = json_str_field(req.body, "token");
-        if (!ct_equal(tok, cfg_.auth_token)) {
+        if (!ct_equal(it->second.as_string(), cfg_.auth_token)) {
             auth_fail_count_.fetch_add(1);
             return {401, "application/json", {}, "{\"detail\":\"Invalid access token\"}"};
         }
@@ -273,7 +484,6 @@ HttpResponse NativeHttpServer::handle_request(const HttpRequest& req) {
         return {200, "application/json", hdrs, "{\"ok\":true}"};
     }
 
-    // All remaining endpoints require authentication.
     bool is_post = (m == "POST");
     if (!check_auth(req, is_post)) {
         auth_fail_count_.fetch_add(1);
@@ -297,10 +507,27 @@ HttpResponse NativeHttpServer::handle_request(const HttpRequest& req) {
         return {200, "application/json", {}, oss.str()};
     }
 
+    if (m == "POST" && p == "/api/reset") {
+        try {
+            JsonValue j = parse_json_strict(req.body);
+            const auto& obj = j.as_object();
+            auto sc_it = obj.find("scope");
+            if (sc_it == obj.end() || !sc_it->second.is_string() || sc_it->second.as_string().empty()) {
+                return {400, "application/json", {}, "{\"detail\":\"Explicit non-empty scope required for reset\"}"};
+            }
+            int64_t cash = 10000000;
+            if (auto it = obj.find("cash_cents"); it != obj.end()) cash = it->second.as_int64();
+            if (cash <= 0) return {400, "application/json", {}, "{\"detail\":\"cash_cents must be > 0\"}"};
+            oms_.reset_account(cfg_.env, cash, cash, sc_it->second.as_string());
+            return {200, "application/json", {}, "{\"reset\":true}"};
+        } catch (const std::exception& e) {
+            return {400, "application/json", {}, "{\"detail\":\"" + json_escape(e.what()) + "\"}"};
+        }
+    }
+
     if (m == "GET" && p == "/api/market/feed/status") {
         bool ds_ok = false;
-        std::string sym;
-        std::string src;
+        std::string sym, src;
         size_t nbars = 0;
         {
             std::lock_guard<std::mutex> lk(mu_);
@@ -340,20 +567,31 @@ HttpResponse NativeHttpServer::handle_request(const HttpRequest& req) {
     }
 
     if (m == "POST" && p == "/api/risk/halt") {
-        std::string action = json_str_field(req.body, "action");
-        std::string reason = json_str_field(req.body, "reason");
-        if (action == "resume") {
-            auto cs = oms_.resume(reason.empty() ? "operator_resume" : reason);
+        try {
+            JsonValue j = parse_json_strict(req.body);
+            const auto& obj = j.as_object();
+            std::string action = "halt";
+            if (auto it = obj.find("action"); it != obj.end()) action = it->second.as_string();
+            std::string reason = "";
+            if (auto it = obj.find("reason"); it != obj.end()) reason = it->second.as_string();
+            if (action == "resume") {
+                auto cs = oms_.resume(reason.empty() ? "operator_resume" : reason);
+                std::ostringstream oss;
+                oss << "{\"halted\":false,\"control_epoch\":" << cs.control_epoch << "}";
+                return {200, "application/json", {}, oss.str()};
+            }
+            if (action != "halt") {
+                return {400, "application/json", {}, "{\"detail\":\"Invalid halt action\"}"};
+            }
+            auto hr = oms_.halt(cfg_.env, reason.empty() ? "operator_halt" : reason);
             std::ostringstream oss;
-            oss << "{\"halted\":false,\"control_epoch\":" << cs.control_epoch << "}";
+            oss << "{\"halted\":true,\"control_epoch\":" << hr.control_epoch
+                << ",\"in_flight_unknown\":" << hr.in_flight_unknown_count
+                << ",\"note\":\"" << json_escape(hr.note) << "\"}";
             return {200, "application/json", {}, oss.str()};
+        } catch (const std::exception& e) {
+            return {400, "application/json", {}, "{\"detail\":\"" + json_escape(e.what()) + "\"}"};
         }
-        auto hr = oms_.halt(cfg_.env, reason.empty() ? "operator_halt" : reason);
-        std::ostringstream oss;
-        oss << "{\"halted\":true,\"control_epoch\":" << hr.control_epoch
-            << ",\"in_flight_unknown\":" << hr.in_flight_unknown_count
-            << ",\"note\":\"" << json_escape(hr.note) << "\"}";
-        return {200, "application/json", {}, oss.str()};
     }
 
     if (m == "GET" && p == "/api/broker/paper-orders") {
@@ -364,10 +602,14 @@ HttpResponse NativeHttpServer::handle_request(const HttpRequest& req) {
             const auto& o = orders[i];
             if (i > 0) oss << ",";
             oss << "{\"client_order_id\":\"" << json_escape(o.client_order_id)
+                << "\",\"account_id\":\"" << json_escape(o.account_id)
                 << "\",\"symbol\":\"" << json_escape(o.symbol)
                 << "\",\"side\":\"" << (o.side == AQ_SIDE_BUY ? "BUY" : "SELL")
+                << "\",\"order_type\":\"" << (o.order_type == AQ_ORDER_MARKET ? "MARKET" : "LIMIT")
                 << "\",\"qty\":" << o.qty << ",\"filled_qty\":" << o.filled_qty
                 << ",\"limit_price_cents\":" << o.limit_price_cents
+                << ",\"stop_cents\":" << o.stop_cents
+                << ",\"target_cents\":" << o.target_cents
                 << ",\"reserved_cash_cents\":" << o.reserved_cash_cents
                 << ",\"state\":\"" << order_state_to_str(o.state)
                 << "\",\"reason_mask\":" << o.reason_mask << "}";
@@ -377,85 +619,205 @@ HttpResponse NativeHttpServer::handle_request(const HttpRequest& req) {
     }
 
     if (m == "POST" && p == "/api/orders") {
-        std::string cid = json_str_field(req.body, "client_order_id");
-        std::string sym = json_str_field(req.body, "symbol");
-        std::string side_s = json_str_field(req.body, "side");
-        int64_t qty = json_i64_field(req.body, "qty", 0);
-        int64_t price_cents = json_i64_field(req.body, "price_cents", 0);
-        if (cid.empty() || sym.empty() || qty <= 0 || price_cents <= 0) {
-            return {400, "application/json", {}, "{\"detail\":\"Missing or invalid order fields\"}"};
-        }
-        aq_instrument_spec_t spec{};
-        spec.abi_version = AQ_CORE_ABI_VERSION;
-        spec.struct_size = sizeof(spec);
-        std::snprintf(spec.symbol, sizeof(spec.symbol), "%s", sym.c_str());
-        std::snprintf(spec.currency, sizeof(spec.currency), "USD");
-        spec.price_scale = 100;
-        spec.qty_scale = 1;
-        spec.tick_size = 1;
+        // R2: Strict bounded JSON parsing & schema validation. Never reinterpret invalid fields!
+        try {
+            JsonValue j = parse_json_strict(req.body);
+            const auto& obj = j.as_object();
+            static const std::set<std::string> kAllowed = {
+                "client_order_id", "account_id", "symbol", "side", "order_type",
+                "qty", "price_cents", "stop_cents", "target_cents", "time_in_force"
+            };
+            for (const auto& kv : obj) {
+                if (!kAllowed.count(kv.first)) {
+                    return {400, "application/json", {}, "{\"detail\":\"Unsupported field: " + json_escape(kv.first) + "\"}"};
+                }
+            }
+            auto req_str = [&](const char* k) -> std::string {
+                auto it = obj.find(k);
+                if (it == obj.end() || !it->second.is_string() || it->second.as_string().empty()) {
+                    throw std::runtime_error(std::string("Missing or invalid string field: ") + k);
+                }
+                return it->second.as_string();
+            };
+            std::string cid = req_str("client_order_id");
+            std::string sym = req_str("symbol");
+            if (sym.size() >= AQ_MAX_SYMBOL_LEN) {
+                return {400, "application/json", {}, "{\"detail\":\"Symbol exceeds AQ_MAX_SYMBOL_LEN\"}"};
+            }
+            std::string side_s = req_str("side");
+            uint8_t side_u = 0;
+            if (side_s == "BUY") side_u = AQ_SIDE_BUY;
+            else if (side_s == "SELL") side_u = AQ_SIDE_SELL;
+            else return {400, "application/json", {}, "{\"detail\":\"Invalid side; must be BUY or SELL\"}"};
 
-        aq_order_intent_t intent{};
-        intent.abi_version = AQ_CORE_ABI_VERSION;
-        intent.struct_size = sizeof(intent);
-        std::snprintf(intent.symbol, sizeof(intent.symbol), "%s", sym.c_str());
-        intent.side = (side_s == "SELL") ? AQ_SIDE_SELL : AQ_SIDE_BUY;
-        intent.order_type = AQ_ORDER_LIMIT;
-        intent.qty = qty;
-        intent.price_cents = price_cents;
-        intent.data_age_ms = 0;
+            std::string otype_s = "LIMIT";
+            if (auto it = obj.find("order_type"); it != obj.end()) otype_s = it->second.as_string();
+            uint8_t otype_u = 0;
+            if (otype_s == "LIMIT") otype_u = AQ_ORDER_LIMIT;
+            else if (otype_s == "MARKET") otype_u = AQ_ORDER_MARKET;
+            else return {400, "application/json", {}, "{\"detail\":\"Unsupported order_type\"}"};
 
-        aq_risk_policy_t pol{};
-        {
-            std::lock_guard<std::mutex> lk(mu_);
-            pol = policy_;
+            std::string tif = "DAY";
+            if (auto it = obj.find("time_in_force"); it != obj.end()) {
+                tif = it->second.as_string();
+                if (tif != "DAY" && tif != "IOC") {
+                    return {400, "application/json", {}, "{\"detail\":\"Unsupported time_in_force\"}"};
+                }
+            }
+
+            std::string account_id = "default";
+            if (auto it = obj.find("account_id"); it != obj.end()) {
+                account_id = it->second.as_string();
+                if (account_id.empty()) return {400, "application/json", {}, "{\"detail\":\"Empty account_id\"}"};
+            }
+
+            auto it_qty = obj.find("qty");
+            if (it_qty == obj.end() || !it_qty->second.is_int64() || it_qty->second.as_int64() <= 0) {
+                return {400, "application/json", {}, "{\"detail\":\"qty must be a positive exact integer\"}"};
+            }
+            int64_t qty = it_qty->second.as_int64();
+
+            auto it_px = obj.find("price_cents");
+            if (it_px == obj.end() || !it_px->second.is_int64() || it_px->second.as_int64() <= 0) {
+                return {400, "application/json", {}, "{\"detail\":\"price_cents must be a positive exact integer\"}"};
+            }
+            int64_t price_cents = it_px->second.as_int64();
+
+            int64_t stop_cents = 0;
+            if (auto it = obj.find("stop_cents"); it != obj.end()) {
+                if (!it->second.is_int64() || it->second.as_int64() < 0) {
+                    return {400, "application/json", {}, "{\"detail\":\"stop_cents must be non-negative integer\"}"};
+                }
+                stop_cents = it->second.as_int64();
+            }
+            int64_t target_cents = 0;
+            if (auto it = obj.find("target_cents"); it != obj.end()) {
+                if (!it->second.is_int64() || it->second.as_int64() < 0) {
+                    return {400, "application/json", {}, "{\"detail\":\"target_cents must be non-negative integer\"}"};
+                }
+                target_cents = it->second.as_int64();
+            }
+
+            // Server-owned freshness calculation from loaded market snapshot (never literal 0!).
+            int64_t data_age_ms = 0;
+            aq_risk_policy_t pol{};
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                pol = policy_;
+                if (!dataset_loaded_ || dataset_.symbol != sym || dataset_.bars.empty()) {
+                    data_age_ms = pol.max_data_age_ms + 1;  // Missing market snapshot -> stale fail-closed
+                } else {
+                    int64_t now_s = (cfg_.override_now_epoch_s > 0) ? cfg_.override_now_epoch_s : now_epoch_s();
+                    int64_t avail_s = dataset_.bars.back().available_epoch_s;
+                    int64_t age_s = std::max<int64_t>(0, now_s - avail_s);
+                    data_age_ms = age_s * 1000;
+                }
+            }
+
+            aq_instrument_spec_t spec{};
+            spec.abi_version = AQ_CORE_ABI_VERSION;
+            spec.struct_size = sizeof(spec);
+            std::snprintf(spec.symbol, sizeof(spec.symbol), "%s", sym.c_str());
+            std::snprintf(spec.currency, sizeof(spec.currency), "USD");
+            spec.price_scale = 100;
+            spec.qty_scale = 1;
+            spec.tick_size = 1;
+
+            aq_order_intent_t intent{};
+            intent.abi_version = AQ_CORE_ABI_VERSION;
+            intent.struct_size = sizeof(intent);
+            std::snprintf(intent.symbol, sizeof(intent.symbol), "%s", sym.c_str());
+            intent.side = side_u;
+            intent.order_type = otype_u;
+            intent.qty = qty;
+            intent.price_cents = price_cents;
+            intent.stop_cents = stop_cents;
+            intent.target_cents = target_cents;
+            intent.data_age_ms = data_age_ms;
+
+            auto sub = oms_.submit_intent(cfg_.env, cid, spec, intent, pol, 25, account_id, tif);
+            if (sub.conflict) {
+                return {409, "application/json", {}, "{\"detail\":\"client_order_id conflict with different order economics\"}"};
+            }
+            std::ostringstream oss;
+            oss << "{\"approved\":" << (sub.accepted_for_reservation ? "true" : "false")
+                << ",\"duplicate_idempotent\":" << (sub.duplicate_idempotent ? "true" : "false")
+                << ",\"client_order_id\":\"" << json_escape(sub.order.client_order_id)
+                << "\",\"side\":\"" << side_s << "\",\"order_type\":\"" << otype_s
+                << "\",\"qty\":" << sub.order.qty << ",\"stop_cents\":" << sub.order.stop_cents
+                << ",\"target_cents\":" << sub.order.target_cents
+                << ",\"state\":\"" << order_state_to_str(sub.order.state)
+                << "\",\"reason_mask\":" << sub.decision.reason_mask << "}";
+            return {sub.accepted_for_reservation ? 200 : 422, "application/json", {}, oss.str()};
+        } catch (const std::exception& e) {
+            return {400, "application/json", {}, "{\"detail\":\"" + json_escape(e.what()) + "\"}"};
         }
-        auto sub = oms_.submit_intent(cfg_.env, cid, spec, intent, pol);
-        std::ostringstream oss;
-        oss << "{\"approved\":" << (sub.accepted_for_reservation ? "true" : "false")
-            << ",\"duplicate_idempotent\":" << (sub.duplicate_idempotent ? "true" : "false")
-            << ",\"client_order_id\":\"" << json_escape(sub.order.client_order_id)
-            << "\",\"state\":\"" << order_state_to_str(sub.order.state)
-            << "\",\"reason_mask\":" << sub.decision.reason_mask << "}";
-        return {sub.accepted_for_reservation ? 200 : 422, "application/json", {}, oss.str()};
     }
 
     if (m == "POST" && p == "/api/training/jobs") {
-        Dataset ds_copy;
         {
             std::lock_guard<std::mutex> lk(mu_);
             if (!dataset_loaded_) {
                 return {400, "application/json", {}, "{\"detail\":\"No dataset loaded for training\"}"};
             }
-            ds_copy = dataset_;
         }
-        uint32_t updates = static_cast<uint32_t>(std::clamp<int64_t>(json_i64_field(req.body, "updates", 2), 1, 16));
-        TrainConfig tcfg;
-        tcfg.seed = static_cast<uint64_t>(std::max<int64_t>(1, json_i64_field(req.body, "seed", 26)));
-        tcfg.updates = updates;
-        tcfg.rollout_steps = 32;
-        std::string job_id = "job-" + random_hex(6);
-        std::string out_dir = cfg_.db_path + ".jobs/" + job_id;
-        auto sum = train_ppo(ds_copy, out_dir, tcfg);
+        uint32_t updates = 2;
+        uint64_t seed = 26;
+        if (!req.body.empty()) {
+            try {
+                JsonValue j = parse_json_strict(req.body);
+                const auto& obj = j.as_object();
+                if (auto it = obj.find("updates"); it != obj.end()) {
+                    updates = static_cast<uint32_t>(std::clamp<int64_t>(it->second.as_int64(), 1, 16));
+                }
+                if (auto it = obj.find("seed"); it != obj.end()) {
+                    seed = static_cast<uint64_t>(std::max<int64_t>(1, it->second.as_int64()));
+                }
+            } catch (const std::exception& e) {
+                return {400, "application/json", {}, "{\"detail\":\"" + json_escape(e.what()) + "\"}"};
+            }
+        }
+        auto job = std::make_shared<TrainingJobInfo>();
+        job->job_id = "job-" + random_hex(6);
+        job->status = "QUEUED";
+        job->updates = updates;
+        job->seed = seed;
         {
-            std::lock_guard<std::mutex> lk(mu_);
-            jobs_.push_back(TrainingJobInfo{job_id, "COMPLETED", sum.updates_completed, sum.checkpoint_hash, sum.final_eval_equity_usd});
+            std::lock_guard<std::mutex> lk(jobs_mu_);
+            jobs_.push_back(job);
+            job_queue_.push_back(job);
         }
+        jobs_cv_.notify_one();
+
         std::ostringstream oss;
-        oss << "{\"job_id\":\"" << job_id << "\",\"status\":\"COMPLETED\",\"updates\":" << sum.updates_completed
-            << ",\"checkpoint_hash\":\"" << sum.checkpoint_hash << "\",\"eval_equity_usd\":" << sum.final_eval_equity_usd << "}";
+        oss << "{\"job_id\":\"" << job->job_id << "\",\"status\":\"QUEUED\",\"updates\":" << job->updates << "}";
         return {200, "application/json", {}, oss.str()};
     }
 
+    if (m == "POST" && p.rfind("/api/training/jobs/", 0) == 0 && p.size() > 26 && p.substr(p.size() - 7) == "/cancel") {
+        std::string jid = p.substr(19, p.size() - 19 - 7);
+        std::lock_guard<std::mutex> lk(jobs_mu_);
+        for (auto& j : jobs_) {
+            if (j->job_id == jid) {
+                j->cancel_requested.store(true);
+                if (j->status == "QUEUED") j->status = "CANCELLED";
+                return {200, "application/json", {}, "{\"job_id\":\"" + jid + "\",\"cancel_requested\":true}"};
+            }
+        }
+        return {404, "application/json", {}, "{\"detail\":\"Job not found\"}"};
+    }
+
     if (m == "GET" && p == "/api/training/jobs") {
-        std::lock_guard<std::mutex> lk(mu_);
+        std::lock_guard<std::mutex> lk(jobs_mu_);
         std::ostringstream oss;
         oss << "{\"jobs\":[";
         for (size_t i = 0; i < jobs_.size(); ++i) {
+            const auto& j = jobs_[i];
             if (i > 0) oss << ",";
-            oss << "{\"job_id\":\"" << jobs_[i].job_id << "\",\"status\":\"" << jobs_[i].status
-                << "\",\"updates\":" << jobs_[i].updates
-                << ",\"checkpoint_hash\":\"" << jobs_[i].checkpoint_hash
-                << "\",\"eval_equity_usd\":" << jobs_[i].eval_equity_usd << "}";
+            oss << "{\"job_id\":\"" << j->job_id << "\",\"status\":\"" << j->status
+                << "\",\"updates\":" << j->updates
+                << ",\"checkpoint_hash\":\"" << j->checkpoint_hash
+                << "\",\"eval_equity_usd\":" << j->eval_equity_usd << "}";
         }
         oss << "]}";
         return {200, "application/json", {}, oss.str()};
@@ -473,101 +835,98 @@ HttpResponse NativeHttpServer::handle_request(const HttpRequest& req) {
 
 void NativeHttpServer::start() {
     if (running_.load()) return;
-    listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd_ < 0) throw std::runtime_error("socket() failed");
-
-    int opt = 1;
-    ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(cfg_.port);
-    if (::inet_pton(AF_INET, cfg_.host.c_str(), &addr.sin_addr) != 1) {
-        ::close(listen_fd_);
-        listen_fd_ = -1;
-        throw std::runtime_error("Invalid bind host");
-    }
-    if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
-        ::listen(listen_fd_, 32) != 0) {
-        ::close(listen_fd_);
-        listen_fd_ = -1;
-        throw std::runtime_error("bind/listen failed");
-    }
-
-    sockaddr_in bound{};
-    socklen_t blen = sizeof(bound);
-    if (::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&bound), &blen) == 0) {
-        bound_port_ = ntohs(bound.sin_port);
-    }
-
+    net_ = new NetImpl(cfg_.host, cfg_.port);
+    bound_port_ = net_->acceptor.local_endpoint().port();
     running_.store(true);
-    accept_thread_ = std::thread([this]() {
-        while (running_.load()) {
-            sockaddr_in cli{};
-            socklen_t clen = sizeof(cli);
-            int cfd = ::accept(listen_fd_, reinterpret_cast<sockaddr*>(&cli), &clen);
-            if (cfd < 0) {
-                if (!running_.load()) break;
-                continue;
+
+    auto do_accept = std::make_shared<std::function<void()>>();
+    std::weak_ptr<std::function<void()>> weak_accept = do_accept;
+    *do_accept = [this, weak_accept]() {
+        auto strong = weak_accept.lock();
+        if (!strong) return;
+        net_->acceptor.async_accept([this, strong, weak_accept](beast::error_code ec, tcp::socket sock) {
+            if (!ec && running_.load()) {
+                auto stream = std::make_shared<beast::tcp_stream>(std::move(sock));
+                auto buf = std::make_shared<beast::flat_buffer>();
+                auto parser = std::make_shared<http::request_parser<http::string_body>>();
+                parser->header_limit(kMaxHttpHeaderBytes);
+                parser->body_limit(kMaxHttpBodyBytes);
+                stream->expires_after(std::chrono::milliseconds(cfg_.io_timeout_ms));
+
+                http::async_read(*stream, *buf, *parser,
+                    [this, stream, buf, parser](beast::error_code rec, std::size_t) {
+                        HttpResponse resp;
+                        if (rec) {
+                            if (rec == http::error::end_of_stream ||
+                                rec == beast::error::timeout ||
+                                rec == boost::asio::error::operation_aborted ||
+                                rec == boost::asio::error::eof ||
+                                rec == boost::asio::error::connection_reset ||
+                                rec == boost::asio::error::broken_pipe) {
+                                beast::error_code ig;
+                                stream->socket().shutdown(tcp::socket::shutdown_both, ig);
+                                return;
+                            }
+                            resp = {400, "application/json", {}, "{\"detail\":\"" + json_escape(rec.message()) + "\"}"};
+                        } else {
+                            try {
+                                const auto& breq = parser->get();
+                                HttpRequest req;
+                                req.method = std::string(breq.method_string());
+                                req.path = std::string(breq.target());
+                                req.body = breq.body();
+                                beast::error_code ep_ec;
+                                auto ep = stream->socket().remote_endpoint(ep_ec);
+                                if (!ep_ec) req.remote_addr = ep.address().to_string();
+                                for (const auto& f : breq) {
+                                    req.headers[std::string(f.name_string())] = std::string(f.value());
+                                }
+                                resp = handle_request(req);
+                            } catch (const std::exception& e) {
+                                resp = {400, "application/json", {}, "{\"detail\":\"" + json_escape(e.what()) + "\"}"};
+                            }
+                        }
+
+                        auto bres = std::make_shared<http::response<http::string_body>>(
+                            static_cast<http::status>(resp.status_code), 11);
+                        bres->reason(reason_text(resp.status_code));
+                        bres->set(http::field::content_type, resp.content_type);
+                        bres->set(http::field::connection, "close");
+                        for (const auto& kv : resp.headers) {
+                            bres->set(kv.first, kv.second);
+                        }
+                        bres->body() = std::move(resp.body);
+                        bres->prepare_payload();
+
+                        stream->expires_after(std::chrono::milliseconds(cfg_.io_timeout_ms));
+                        http::async_write(*stream, *bres,
+                            [stream, bres](beast::error_code, std::size_t) {
+                                beast::error_code ig;
+                                stream->socket().shutdown(tcp::socket::shutdown_both, ig);
+                            });
+                    });
             }
-            char buf[8192];
-            ssize_t n = ::recv(cfd, buf, sizeof(buf) - 1, 0);
-            if (n > 0) {
-                buf[n] = '\0';
-                std::string raw(buf, static_cast<size_t>(n));
-                size_t hdr_end = raw.find("\r\n\r\n");
-                HttpRequest req;
-                std::string hdr_part = (hdr_end == std::string::npos) ? raw : raw.substr(0, hdr_end);
-                if (hdr_end != std::string::npos) req.body = raw.substr(hdr_end + 4);
-
-                std::istringstream hss(hdr_part);
-                std::string req_line;
-                std::getline(hss, req_line);
-                if (!req_line.empty() && req_line.back() == '\r') req_line.pop_back();
-                std::istringstream rl(req_line);
-                rl >> req.method >> req.path;
-
-                std::string line;
-                while (std::getline(hss, line)) {
-                    if (!line.empty() && line.back() == '\r') line.pop_back();
-                    size_t col = line.find(':');
-                    if (col != std::string::npos) {
-                        std::string k = line.substr(0, col);
-                        std::string v = line.substr(col + 1);
-                        while (!v.empty() && v.front() == ' ') v.erase(v.begin());
-                        req.headers[k] = v;
-                    }
-                }
-                char ipbuf[INET_ADDRSTRLEN]{};
-                ::inet_ntop(AF_INET, &cli.sin_addr, ipbuf, sizeof(ipbuf));
-                req.remote_addr = ipbuf;
-
-                HttpResponse resp = handle_request(req);
-                std::ostringstream out;
-                out << "HTTP/1.1 " << resp.status_code << " OK\r\n"
-                    << "Content-Type: " << resp.content_type << "\r\n"
-                    << "Content-Length: " << resp.body.size() << "\r\n"
-                    << "Connection: close\r\n";
-                for (const auto& kv : resp.headers) {
-                    out << kv.first << ": " << kv.second << "\r\n";
-                }
-                out << "\r\n" << resp.body;
-                std::string wire = out.str();
-                ::send(cfd, wire.data(), wire.size(), 0);
+            if (running_.load()) {
+                if (auto next = weak_accept.lock()) (*next)();
             }
-            ::close(cfd);
-        }
-    });
+        });
+    };
+    (*do_accept)();
+    net_->io_thread = std::thread([this]() { net_->ioc.run(); });
 }
 
 void NativeHttpServer::stop() {
     if (!running_.exchange(false)) return;
-    if (listen_fd_ >= 0) {
-        ::shutdown(listen_fd_, SHUT_RDWR);
-        ::close(listen_fd_);
-        listen_fd_ = -1;
+    if (net_) {
+        net::post(net_->ioc, [this]() {
+            beast::error_code ig;
+            net_->acceptor.close(ig);
+        });
+        net_->ioc.stop();
+        if (net_->io_thread.joinable()) net_->io_thread.join();
+        delete net_;
+        net_ = nullptr;
     }
-    if (accept_thread_.joinable()) accept_thread_.join();
 }
 
 }  // namespace aq

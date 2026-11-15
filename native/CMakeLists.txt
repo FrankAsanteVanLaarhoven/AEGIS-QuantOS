@@ -14,6 +14,7 @@ option(AQ_ENABLE_SANITIZERS "Enable ASan and UBSan" OFF)
 find_package(Threads REQUIRED)
 find_package(SQLite3 REQUIRED)
 find_package(OpenSSL REQUIRED)
+find_package(Boost REQUIRED)
 
 set(AQ_COMMON_FLAGS -Wall -Wextra -Werror -fno-fast-math)
 if(AQ_ENABLE_SANITIZERS)
@@ -31,10 +32,11 @@ add_library(aq_engine STATIC
     src/model.cpp
     src/rl.cpp
     src/inference_abi.cpp
+    src/json.cpp
     src/oms.cpp
     src/service.cpp
 )
-target_include_directories(aq_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_include_directories(aq_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${Boost_INCLUDE_DIRS})
 target_link_libraries(aq_engine PUBLIC aq_core SQLite::SQLite3 OpenSSL::Crypto Threads::Threads)
 target_compile_options(aq_engine PRIVATE ${AQ_COMMON_FLAGS})
 

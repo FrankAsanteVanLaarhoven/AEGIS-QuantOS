@@ -677,11 +677,11 @@ int main() {
         auto r_halt = srv.handle_request({"POST", "/api/risk/halt", {{"Cookie", sid}, {"X-CSRF-Token", csrf}}, "{\"action\":\"halt\",\"reason\":\"test\"}"});
         AQ_CHECK(r_halt.status_code == 200 && r_halt.body.find("\"halted\":true") != std::string::npos);
 
-        // Authenticated /api/market/NVDA and /api/training/jobs
+        // Authenticated /api/market/NVDA and async /api/training/jobs
         auto r_mkt = srv.handle_request({"GET", "/api/market/NVDA", {{"Cookie", sid}}, ""});
         AQ_CHECK(r_mkt.status_code == 200 && r_mkt.body.find("available_at") != std::string::npos);
         auto r_job = srv.handle_request({"POST", "/api/training/jobs", {{"Cookie", sid}, {"X-CSRF-Token", csrf}}, "{\"updates\":1}"});
-        AQ_CHECK(r_job.status_code == 200 && r_job.body.find("\"status\":\"COMPLETED\"") != std::string::npos);
+        AQ_CHECK(r_job.status_code == 200 && r_job.body.find("\"status\":\"QUEUED\"") != std::string::npos);
 
         // Real POSIX TCP socket roundtrip
         srv.start();
@@ -703,8 +703,8 @@ int main() {
     });
     run_check("c2_oms_idempotency_crash_recovery_partial_and_fill", [&] {
         aq::NativeOms oms(tmp_dir + "/n3_oms.sqlite");
-        oms.init_account("paper_native", 100000, 100000);
-        oms.acquire_writer_lease("paper_native", "w1", 1);
+        oms.seed_account_if_absent("paper_native", 100000, 100000);
+        AQ_CHECK(oms.try_acquire_writer_lease("paper_native", "w1", 0, 1));
         auto spec = make_spec("NVDA");
         auto pol = make_policy();
         auto intent = make_intent("NVDA", AQ_SIDE_BUY, 10, 2000);  // $200
@@ -712,7 +712,7 @@ int main() {
         auto s1 = oms.submit_intent("paper_native", "cid-1", spec, intent, pol);
         AQ_CHECK(s1.accepted_for_reservation && !s1.duplicate_idempotent);
         auto s2 = oms.submit_intent("paper_native", "cid-1", spec, intent, pol);
-        AQ_CHECK(s2.duplicate_idempotent && s2.order.client_order_id == "cid-1");
+        AQ_CHECK(s2.duplicate_idempotent && !s2.conflict && s2.order.client_order_id == "cid-1");
 
         // Crash before transport -> DISPATCHED_UNKNOWN with reservation intact
         auto crashed = oms.dispatch_reserved("paper_native", "cid-1", "w1", 1, pol,
@@ -721,9 +721,9 @@ int main() {
         AQ_CHECK(oms.recover_in_flight("paper_native").size() == 1);
 
         // Partial fill 5 of 10, then full fill 10 of 10
-        auto p1 = oms.reconcile_order("cid-1", {aq::OrderState::PARTIAL, "brk-1", 5, 2000, 10, "partial_5"});
+        auto p1 = oms.reconcile_order("cid-1", {aq::OrderState::PARTIAL, "brk-1", "ex-1", true, false, 5, 2000, 10, "partial_5"});
         AQ_CHECK(p1.state == aq::OrderState::PARTIAL && p1.filled_qty == 5 && p1.reserved_cash_cents > 0);
-        auto p2 = oms.reconcile_order("cid-1", {aq::OrderState::FILLED, "brk-1", 10, 2000, 10, "filled_10"});
+        auto p2 = oms.reconcile_order("cid-1", {aq::OrderState::FILLED, "brk-1", "ex-2", true, false, 10, 2000, 10, "filled_10"});
         AQ_CHECK(p2.state == aq::OrderState::FILLED && p2.filled_qty == 10 && p2.reserved_cash_cents == 0);
         auto snap = oms.account_snapshot("paper_native");
         AQ_CHECK(snap.cash_cents == 100000 - 20000 - 20);
@@ -731,8 +731,8 @@ int main() {
     });
     run_check("c2_c5_halt_race_and_writer_lease_fencing", [&] {
         aq::NativeOms oms(tmp_dir + "/n3_fence.sqlite");
-        oms.init_account("paper_native", 100000, 100000);
-        oms.acquire_writer_lease("paper_native", "w1", 1);
+        oms.seed_account_if_absent("paper_native", 100000, 100000);
+        AQ_CHECK(oms.try_acquire_writer_lease("paper_native", "w1", 0, 1));
         auto spec = make_spec("NVDA");
         auto pol = make_policy();
         auto sub = oms.submit_intent("paper_native", "cid-halt", spec, make_intent("NVDA", AQ_SIDE_BUY, 10, 2000), pol);
@@ -754,13 +754,13 @@ int main() {
         auto rec = oms.dispatch_reserved("paper_native", "cid-halt", "w1", 1, pol,
             [&](const aq::OmsOrderRecord&) {
                 transport_called = true;
-                return aq::DispatchOutcome{aq::OrderState::ACCEPTED, "b", 0, 0, 0, ""};
+                return aq::DispatchOutcome{aq::OrderState::ACCEPTED, "b", "", true, false, 0, 0, 0, ""};
             });
         AQ_CHECK(!transport_called && rec.state == aq::OrderState::REJECTED && rec.reserved_cash_cents == 0);
     });
     run_check("gate4_oms_100_concurrent_reservations_no_concentration_breach", [&] {
         aq::NativeOms oms(tmp_dir + "/n3_conc.sqlite");
-        oms.init_account("paper_native", 100000, 100000);  // $1,000
+        oms.seed_account_if_absent("paper_native", 100000, 100000);  // $1,000
         auto spec = make_spec("NVDA");
         auto pol = make_policy();
         pol.max_order_notional_bps = 2500;
@@ -780,11 +780,223 @@ int main() {
         for (auto& th : ths) th.join();
         AQ_CHECK(approved.load() == 1);  // Only 1x $250 fits under 35% ($350) concentration cap!
     });
-    run_check("c4_shadow_parity_exact_accounting_and_verdict", [] {
+    run_check("c4_replay_repeatability_and_independent_shadow_parity", [] {
         auto ds = aq::generate_synthetic_dataset(160, 26);
         aq::ActorCritic ac(26);
-        auto rep = aq::run_shadow_parity_check(ds, aq::default_sim_config(), &ac, "shadow26");
-        AQ_CHECK(rep.exact_accounting_parity && rep.exact_verdict_parity && rep.steps_compared > 0);
+        auto rep = aq::run_replay_repeatability_check(ds, aq::default_sim_config(), &ac, "shadow26");
+        AQ_CHECK(rep.exact_repeatability && rep.steps_compared > 0);
+    });
+    run_check("r1_non_destructive_startup_100_restarts_and_readonly_observer", [&] {
+        std::string db = tmp_dir + "/r1_restarts.sqlite";
+        {
+            aq::NativeOms oms(db);
+            oms.seed_account_if_absent("paper_native", 7654321, 7754321);
+            oms.upsert_position("paper_native", "NVDA", 10, 10000);
+            AQ_CHECK(oms.try_acquire_writer_lease("paper_native", "active-writer", 0, 1));
+            auto pol = make_policy();
+            auto spec = make_spec("NVDA");
+            auto sub = oms.submit_intent("paper_native", "r1-ord", spec, make_intent("NVDA", AQ_SIDE_BUY, 5, 10000), pol, 0);
+            AQ_CHECK(sub.accepted_for_reservation);
+            oms.halt("paper_native", "persisted_halt_reason");
+        }
+        // 100 cold reopen/server-init cycles with enable_paper_writer=false must preserve cash, equity, pos, halt, lease!
+        for (int i = 0; i < 100; ++i) {
+            aq::ServiceConfig cfg;
+            cfg.db_path = db;
+            cfg.auth_token = "tok";
+            cfg.enable_paper_writer = false;
+            aq::NativeHttpServer srv(cfg);
+            auto snap = srv.oms().account_snapshot("paper_native");
+            AQ_CHECK(snap.cash_cents == 7654321 && snap.equity_cents == 7754321);
+            AQ_CHECK(snap.positions.size() == 1 && snap.positions[0].qty == 10);
+            AQ_CHECK(srv.oms().has_active_writer_lease("paper_native", "active-writer", 1));
+            auto cs = srv.oms().control_state();
+            AQ_CHECK(cs.halted && cs.reason == "persisted_halt_reason");
+        }
+    });
+    run_check("r2_strict_order_json_rejects_invalid_and_preserves_stops", [&] {
+        aq::ServiceConfig cfg;
+        cfg.db_path = tmp_dir + "/r2_orders.sqlite";
+        cfg.auth_token = "tok";
+        auto ds = aq::generate_synthetic_dataset(100, 26);
+        aq::NativeHttpServer srv(cfg);
+        srv.load_dataset(ds);
+        srv.set_override_now_epoch_s(ds.bars.back().available_epoch_s + 5);  // 5s fresh
+
+        // side="SEEL" -> 400
+        auto r1 = srv.handle_request({"POST", "/api/orders", {{"X-AEGIS-Token", "tok"}},
+            "{\"client_order_id\":\"o1\",\"symbol\":\"NVDA\",\"side\":\"SEEL\",\"qty\":10,\"price_cents\":10000}"});
+        AQ_CHECK(r1.status_code == 400);
+        // qty=1.9 -> 400
+        auto r2 = srv.handle_request({"POST", "/api/orders", {{"X-AEGIS-Token", "tok"}},
+            "{\"client_order_id\":\"o2\",\"symbol\":\"NVDA\",\"side\":\"BUY\",\"qty\":1.9,\"price_cents\":10000}"});
+        AQ_CHECK(r2.status_code == 400);
+        // Duplicate JSON key -> 400
+        auto r3 = srv.handle_request({"POST", "/api/orders", {{"X-AEGIS-Token", "tok"}},
+            "{\"client_order_id\":\"o3\",\"symbol\":\"NVDA\",\"side\":\"BUY\",\"side\":\"SELL\",\"qty\":1,\"price_cents\":10000}"});
+        AQ_CHECK(r3.status_code == 400);
+        // Unknown field -> 400
+        auto r4 = srv.handle_request({"POST", "/api/orders", {{"X-AEGIS-Token", "tok"}},
+            "{\"client_order_id\":\"o4\",\"symbol\":\"NVDA\",\"side\":\"BUY\",\"qty\":1,\"price_cents\":10000,\"extra\":1}"});
+        AQ_CHECK(r4.status_code == 400);
+        // stop_cents preserved -> 422 AQ_REJ_UNSUPPORTED_PROTECTION
+        auto r5 = srv.handle_request({"POST", "/api/orders", {{"X-AEGIS-Token", "tok"}},
+            "{\"client_order_id\":\"o5\",\"symbol\":\"NVDA\",\"side\":\"BUY\",\"qty\":10,\"price_cents\":10000,\"stop_cents\":9000}"});
+        AQ_CHECK(r5.status_code == 422 && r5.body.find("\"stop_cents\":9000") != std::string::npos);
+        // Valid BUY -> 200; same client_order_id with different qty -> 409 Conflict
+        auto r6 = srv.handle_request({"POST", "/api/orders", {{"X-AEGIS-Token", "tok"}},
+            "{\"client_order_id\":\"o6\",\"symbol\":\"NVDA\",\"side\":\"BUY\",\"qty\":10,\"price_cents\":10000}"});
+        AQ_CHECK(r6.status_code == 200);
+        auto r6_conf = srv.handle_request({"POST", "/api/orders", {{"X-AEGIS-Token", "tok"}},
+            "{\"client_order_id\":\"o6\",\"symbol\":\"NVDA\",\"side\":\"BUY\",\"qty\":12,\"price_cents\":10000}"});
+        AQ_CHECK(r6_conf.status_code == 409);
+        // Stale market snapshot -> 422 AQ_REJ_STALE_DATA
+        srv.set_override_now_epoch_s(ds.bars.back().available_epoch_s + 120);
+        auto r7 = srv.handle_request({"POST", "/api/orders", {{"X-AEGIS-Token", "tok"}},
+            "{\"client_order_id\":\"o7\",\"symbol\":\"NVDA\",\"side\":\"BUY\",\"qty\":10,\"price_cents\":10000}"});
+        AQ_CHECK(r7.status_code == 422);
+    });
+    run_check("r3_partial_fill_conservation_10000_event_corpus_and_reopen", [&] {
+        // Exact counterexample: 10 shares @ $100, 0 fee -> 2/10 -> $800 -> 4/10 -> $600 (zero shortfall!)
+        {
+            aq::NativeOms oms(tmp_dir + "/r3_exact.sqlite");
+            oms.seed_account_if_absent("paper_native", 1000000, 1000000);
+            auto spec = make_spec("NVDA");
+            auto pol = make_policy();
+            pol.max_order_notional_bps = 5000; pol.max_concentration_bps = 5000;
+            auto sub = oms.submit_intent("paper_native", "p1", spec, make_intent("NVDA", AQ_SIDE_BUY, 10, 10000), pol, 0);
+            AQ_CHECK(sub.order.reserved_cash_cents == 100000);
+            auto f1 = oms.reconcile_order("p1", {aq::OrderState::PARTIAL, "b1", "e1", true, false, 2, 10000, 0, "f2"});
+            AQ_CHECK(f1.reserved_cash_cents == 80000);
+            auto f2 = oms.reconcile_order("p1", {aq::OrderState::PARTIAL, "b1", "e2", true, false, 4, 10000, 0, "f4"});
+            AQ_CHECK(f2.reserved_cash_cents == 60000);
+            // Duplicate exec_id ignored, stale cumulative ignored
+            auto fdup = oms.reconcile_order("p1", {aq::OrderState::PARTIAL, "b1", "e2", true, false, 4, 10000, 0, "dup"});
+            AQ_CHECK(fdup.filled_qty == 4 && fdup.reserved_cash_cents == 60000);
+            auto fstale = oms.reconcile_order("p1", {aq::OrderState::PARTIAL, "b1", "e3", true, false, 3, 10000, 0, "stale"});
+            AQ_CHECK(fstale.filled_qty == 4 && fstale.reserved_cash_cents == 60000);
+            // Cancel with additional fill (6 of 10): accounts for fill 6 then releases remaining reserve
+            auto fcan = oms.reconcile_order("p1", {aq::OrderState::CANCELLED, "b1", "e4", true, false, 6, 10500, 15, "cancel_with_fill"});
+            AQ_CHECK(fcan.state == aq::OrderState::CANCELLED && fcan.filled_qty == 6 && fcan.reserved_cash_cents == 0);
+            std::string err;
+            AQ_CHECK(oms.verify_accounting_consistency("paper_native", &err));
+        }
+        // 10,000-event seeded execution corpus conservation check
+        {
+            aq::NativeOms oms(tmp_dir + "/r3_10k.sqlite");
+            oms.seed_account_if_absent("paper_native", 1000000000, 1000000000);
+            auto spec = make_spec("NVDA");
+            auto pol = make_policy();
+            pol.max_order_notional_bps = 5000; pol.max_concentration_bps = 9000; pol.max_gross_exposure_bps = 9000;
+            int64_t expected_cash = 1000000000;
+            int64_t expected_shares = 0;
+            for (int ord = 0; ord < 2000; ++ord) {
+                std::string cid = "k-" + std::to_string(ord);
+                int64_t limit_px = 1000 + (ord % 50) * 10;
+                auto sub = oms.submit_intent("paper_native", cid, spec, make_intent("NVDA", AQ_SIDE_BUY, 10, limit_px), pol, 25);
+                AQ_CHECK(sub.accepted_for_reservation);
+                int64_t cum_notional = 0;
+                for (int step = 1; step <= 5; ++step) {
+                    int64_t cum_qty = step * 2;
+                    int64_t exec_px = limit_px - (step % 3);
+                    int64_t target_notional = cum_qty * exec_px;
+                    int64_t delta_notional = target_notional - cum_notional;
+                    cum_notional = target_notional;
+                    int64_t fee = 5;
+                    auto rec = oms.reconcile_order(cid, {
+                        step == 5 ? aq::OrderState::FILLED : aq::OrderState::PARTIAL,
+                        "brk-" + std::to_string(ord),
+                        "ex-" + std::to_string(ord) + "-" + std::to_string(step),
+                        true, false, cum_qty, exec_px, fee, "step"});
+                    expected_cash -= (delta_notional + fee);
+                    expected_shares += 2;
+                    int64_t rem = 10 - cum_qty;
+                    int64_t exp_res = rem == 0 ? 0 : (rem * limit_px + (rem * limit_px * 25 + 9999) / 10000);
+                    AQ_CHECK(rec.reserved_cash_cents == exp_res);
+                }
+            }
+            auto snap = oms.account_snapshot("paper_native");
+            AQ_CHECK(snap.cash_cents == expected_cash && snap.positions[0].qty == expected_shares);
+            AQ_CHECK(oms.verify_accounting_consistency("paper_native"));
+        }
+    });
+    run_check("r5_beast_segmented_http_slow_client_and_concurrent_training", [&] {
+        aq::ServiceConfig cfg;
+        cfg.db_path = tmp_dir + "/r5_beast.sqlite";
+        cfg.auth_token = "tok";
+        cfg.io_timeout_ms = 250;
+        aq::NativeHttpServer srv(cfg);
+        srv.load_dataset(aq::generate_synthetic_dataset(120, 26));
+        srv.start();
+        uint16_t port = srv.bound_port();
+
+        auto connect_sock = [&]() {
+            int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+            AQ_CHECK(fd >= 0);
+            sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(port);
+            ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+            AQ_CHECK(::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+            return fd;
+        };
+
+        // 1. Segmented multi-send HTTP request
+        int fd1 = connect_sock();
+        std::string body = "{\"client_order_id\":\"seg1\",\"symbol\":\"NVDA\",\"side\":\"SEEL\",\"qty\":1,\"price_cents\":1000}";
+        std::string hdr = "POST /api/orders HTTP/1.1\r\nHost: localhost\r\nX-AEGIS-Token: tok\r\nContent-Length: " +
+                          std::to_string(body.size()) + "\r\n\r\n";
+        AQ_CHECK(::send(fd1, hdr.data(), 20, 0) == 20);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        AQ_CHECK(::send(fd1, hdr.data() + 20, hdr.size() - 20, 0) > 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        AQ_CHECK(::send(fd1, body.data(), body.size(), 0) > 0);
+        char rbuf[4096]{};
+        ssize_t rn = ::recv(fd1, rbuf, sizeof(rbuf) - 1, 0);
+        ::close(fd1);
+        AQ_CHECK(rn > 0 && std::string(rbuf, static_cast<size_t>(rn)).find("400 Bad Request") != std::string::npos);
+
+        // 2. Slow incomplete client + concurrent /api/health stays responsive
+        int fd_slow = connect_sock();
+        const char* partial = "POST /api/orders HTTP/1.1\r\nHost: localhost\r\nContent-Length: 500\r\n\r\n{\"a\":";
+        AQ_CHECK(::send(fd_slow, partial, std::strlen(partial), 0) > 0);
+
+        int fd_fast = connect_sock();
+        const char* hreq = "GET /api/health HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        AQ_CHECK(::send(fd_fast, hreq, std::strlen(hreq), 0) > 0);
+        char hbuf[2048]{};
+        ssize_t hn = ::recv(fd_fast, hbuf, sizeof(hbuf) - 1, 0);
+        ::close(fd_fast);
+        ::close(fd_slow);
+        AQ_CHECK(hn > 0 && std::string(hbuf, static_cast<size_t>(hn)).find("200 OK") != std::string::npos);
+
+        // 3. Conflicting Content-Length + Transfer-Encoding: chunked rejected by Beast
+        int fd_bad = connect_sock();
+        const char* smuggle = "POST /api/orders HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+        AQ_CHECK(::send(fd_bad, smuggle, std::strlen(smuggle), 0) > 0);
+        char bbuf[2048]{};
+        ssize_t bn = ::recv(fd_bad, bbuf, sizeof(bbuf) - 1, 0);
+        ::close(fd_bad);
+        AQ_CHECK(bn > 0 && std::string(bbuf, static_cast<size_t>(bn)).find("400 Bad Request") != std::string::npos);
+
+        srv.stop();
+    });
+    run_check("r6_independent_per_event_parity_1000_events_and_mutation_controls", [] {
+        auto ds = aq::generate_synthetic_dataset(1100, 26);
+        std::vector<uint32_t> tape(1050);
+        for (size_t i = 0; i < tape.size(); ++i) tape[i] = static_cast<uint32_t>(i % 3);
+
+        auto clean = aq::run_independent_shadow_parity(ds, aq::default_sim_config(), tape, aq::ParityMutation::NONE);
+        AQ_CHECK(clean.exact_per_event_parity && clean.events_compared == 1050);
+
+        auto m_fee = aq::run_independent_shadow_parity(ds, aq::default_sim_config(), tape, aq::ParityMutation::MUTATE_FEE);
+        AQ_CHECK(!m_fee.exact_per_event_parity && m_fee.first_divergence_field == "cash_cents");
+
+        auto m_verdict = aq::run_independent_shadow_parity(ds, aq::default_sim_config(), tape, aq::ParityMutation::MUTATE_VERDICT);
+        AQ_CHECK(!m_verdict.exact_per_event_parity && m_verdict.first_divergence_field == "risk_rejected");
+
+        auto m_order = aq::run_independent_shadow_parity(ds, aq::default_sim_config(), tape, aq::ParityMutation::MUTATE_EVENT_ORDER);
+        AQ_CHECK(!m_order.exact_per_event_parity);
     });
 
     std::cout << "ALL_NATIVE_CHECKS_PASSED: " << g_passed << "\n";
