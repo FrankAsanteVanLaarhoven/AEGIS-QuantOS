@@ -1,0 +1,33 @@
+name: native-foundation-ci
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  native-gcc-and-asan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ clang libsqlite3-dev libssl-dev
+      - name: Configure and test GCC Release
+        run: |
+          cmake -S native -B build/native-release -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/native-release -j4
+          ctest --test-dir build/native-release --output-on-failure -V
+      - name: Configure and test GCC ASan+UBSan
+        run: |
+          cmake -S native -B build/native-asan -DCMAKE_BUILD_TYPE=Debug -DAQ_ENABLE_SANITIZERS=ON
+          cmake --build build/native-asan -j4
+          ctest --test-dir build/native-asan --output-on-failure -V
+      - name: Configure and test Clang Release
+        run: |
+          CC=clang CXX=clang++ cmake -S native -B build/native-clang -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/native-clang -j4
+          ctest --test-dir build/native-clang --output-on-failure -V
+      - name: Native CLI and C17 ABI smoke
+        run: |
+          mkdir -p /tmp/aq_ci_smoke
+          ./build/native-release/aegis_native fixture /tmp/aq_ci_smoke/bars.csv 240 26
+          ./build/native-release/aegis_native train /tmp/aq_ci_smoke/bars.csv /tmp/aq_ci_smoke/run 26 8
+          ./build/native-release/aegis_native infer /tmp/aq_ci_smoke/run/policy.aq /tmp/aq_ci_smoke/bars.csv
+          ./build/native-release/aq_c_infer /tmp/aq_ci_smoke/run/policy.aq
