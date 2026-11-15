@@ -87,3 +87,4 @@ def test_sec_edgar_adapter_and_licensed_news_blocker():
     assert news.status()['state'] == 'BLOCKED_CREDENTIAL'
     with pytest.raises(ValueError, match='BLOCKED_CREDENTIAL'):
         news.ingest_items([{'id': 'n1', 'url': 'https://news.example/1', 'published_at': '2026-11-14T12:00:00Z', 'headline': 'Test'}])
+

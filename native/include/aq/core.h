@@ -146,3 +146,4 @@ aq_status_t aq_evaluate_risk(
 #endif
 
 #endif /* AQ_CORE_H */
+

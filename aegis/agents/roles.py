@@ -20,3 +20,4 @@ FINANCE_ROLES: dict[str, RoleSpec] = {
     'evidence_checker': RoleSpec('evidence_checker', ('evidence_as_of', 'numerical_oracle'), 2, 0.05),
     'report_explainer': RoleSpec('report_explainer', ('evidence_as_of', 'quant_summary'), 2, 0.05, abstain_on_empty_evidence=False),
 }
+

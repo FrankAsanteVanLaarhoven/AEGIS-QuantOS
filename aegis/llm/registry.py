@@ -41,3 +41,4 @@ def resolve_role_model(role: str, policy: dict[str, Any], lock: dict[str, Any]) 
         raise ValueError('BLOCKED_MODEL_CONFIGURATION: Unrestricted auto model routing is prohibited')
     fallbacks = locked_role.get('approved_fallbacks') or ((policy.get('roles') or {}).get(role) or {}).get('approved_fallbacks') or []
     return model_id, list(fallbacks)
+

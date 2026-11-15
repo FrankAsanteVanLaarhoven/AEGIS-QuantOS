@@ -45,3 +45,4 @@ int aq_model_predict_v1(
 #endif
 
 #endif /* AQ_INFERENCE_H */
+

@@ -68,3 +68,4 @@ std::string sha256_hex(const uint8_t* data, size_t len);
 std::string sha256_hex(const std::string& s);
 
 }  // namespace aq
+

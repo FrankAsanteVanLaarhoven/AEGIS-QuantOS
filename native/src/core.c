@@ -229,3 +229,4 @@ aq_status_t aq_evaluate_risk(
     out_decision->approved = (out_decision->reason_mask == AQ_REJ_NONE) ? 1u : 0u;
     return AQ_OK;
 }
+

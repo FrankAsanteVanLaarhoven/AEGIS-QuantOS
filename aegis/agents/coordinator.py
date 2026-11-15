@@ -129,3 +129,4 @@ class ResearchCoordinator:
             'llm_calls': 1,
             'cost_usd': assessment.cost_usd,
         }
+

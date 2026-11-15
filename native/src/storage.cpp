@@ -341,3 +341,4 @@ bool ControlJournal::claim_for_dispatch(const std::string& client_order_id, uint
 }
 
 }  // namespace aq
+

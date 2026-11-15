@@ -58,3 +58,4 @@ def restore_and_verify(backup_db: Path, expected_sha256: str, target_db: Path) -
     if integrity != 'ok':
         raise RuntimeError(f'Restored database integrity check failed: {integrity}')
     return {'restored_db': str(target_db), 'sha256_verified': True, 'integrity_check': integrity}
+

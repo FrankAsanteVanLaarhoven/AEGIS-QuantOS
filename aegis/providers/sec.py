@@ -122,3 +122,4 @@ class SecEdgarAdapter:
             entity_cik=padded,
         )
         return {'cik': padded, 'entity_name': data.get('entityName'), 'us_gaap_tags': len(us_gaap)}, doc
+

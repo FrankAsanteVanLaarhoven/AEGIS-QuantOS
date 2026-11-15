@@ -31,3 +31,4 @@ jobs:
           ./build/native-release/aegis_native train /tmp/aq_ci_smoke/bars.csv /tmp/aq_ci_smoke/run 26 8
           ./build/native-release/aegis_native infer /tmp/aq_ci_smoke/run/policy.aq /tmp/aq_ci_smoke/bars.csv
           ./build/native-release/aq_c_infer /tmp/aq_ci_smoke/run/policy.aq
+

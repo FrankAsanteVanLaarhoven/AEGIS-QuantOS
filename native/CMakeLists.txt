@@ -51,3 +51,4 @@ add_executable(test_native tests/test_native.cpp)
 target_link_libraries(test_native PRIVATE aq_engine)
 target_compile_options(test_native PRIVATE ${AQ_COMMON_FLAGS})
 add_test(NAME native_45_checks COMMAND test_native)
+

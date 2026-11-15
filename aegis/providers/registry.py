@@ -40,3 +40,4 @@ def provider_registry(settings: AegisSettings, resolver: SecretResolver) -> dict
             'paid_calls_authorized': settings.enable_paid_llm,
         },
     }
+

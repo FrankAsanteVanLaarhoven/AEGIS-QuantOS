@@ -42,3 +42,4 @@ def test_store_tx_rollback_when_inner_fails(tmp_path):
     except RuntimeError:
         pass
     assert store.get("initial") == {"ok": True}
+

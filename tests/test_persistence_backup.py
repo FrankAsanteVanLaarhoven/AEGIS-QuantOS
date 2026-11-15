@@ -21,3 +21,4 @@ def test_backup_restore_and_migrations(tmp_path: Path):
     restored = restore_and_verify(Path(b['backup_path']), b['manifest']['sha256'], tmp_path / 'restored.sqlite3')
     assert restored['sha256_verified'] is True
     assert restored['integrity_check'] == 'ok'
+

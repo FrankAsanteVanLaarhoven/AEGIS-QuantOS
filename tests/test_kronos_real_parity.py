@@ -44,3 +44,4 @@ def test_kronos_direct_upstream_parity_and_forward_calendar():
     end_res = ka.forecast(ds, ds.length - 1, 'NVDA', horizon=4, samples=2, seed=seed, use_exchange_calendar=True)
     assert end_res['status'] == 'REAL_PRETRAINED_KRONOS'
     assert len(end_res['bands']) == 4
+
