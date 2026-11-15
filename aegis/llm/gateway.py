@@ -131,37 +131,54 @@ class OpenRouterGateway:
         if p_rate == 0.0 and c_rate == 0.0 and req_charge == 0.0 and not pricing.get('free'):
             raise OpenRouterError('BLOCKED_PRICING', f'Zero pricing without explicit free-tier qualification for {model_id}')
         updated_raw = pricing.get('updated_at')
-        if updated_raw:
-            try:
-                updated_dt = datetime.fromisoformat(str(updated_raw).replace('Z', '+00:00'))
-                max_age_h = float(self.policy.get('max_pricing_age_hours', 168.0))
-                age_h = (datetime.now(timezone.utc) - updated_dt.astimezone(timezone.utc)).total_seconds() / 3600.0
-                if age_h > max_age_h:
-                    raise OpenRouterError('BLOCKED_PRICING', f'Stale pricing ({age_h:.1f}h > {max_age_h:.1f}h) for {model_id}')
-            except ValueError as exc:
-                raise OpenRouterError('BLOCKED_PRICING', f'Invalid pricing updated_at timestamp for {model_id}') from exc
+        if not updated_raw:
+            raise OpenRouterError('BLOCKED_PRICING', f'Missing pricing updated_at provenance for {model_id}')
+        try:
+            updated_dt = datetime.fromisoformat(str(updated_raw).replace('Z', '+00:00'))
+            max_age_h = float(self.policy.get('max_pricing_age_hours', 168.0))
+            age_h = (datetime.now(timezone.utc) - updated_dt.astimezone(timezone.utc)).total_seconds() / 3600.0
+            if age_h > max_age_h:
+                raise OpenRouterError('BLOCKED_PRICING', f'Stale pricing ({age_h:.1f}h > {max_age_h:.1f}h) for {model_id}')
+        except ValueError as exc:
+            raise OpenRouterError('BLOCKED_PRICING', f'Invalid pricing updated_at timestamp for {model_id}') from exc
+        max_p_pm = self.policy.get('max_prompt_price_per_million')
+        if max_p_pm is not None and self.per_token_to_per_million(p_rate) > float(max_p_pm):
+            raise OpenRouterError('BLOCKED_PRICING', f'Prompt price exceeds configured unit cap for {model_id}')
+        max_c_pm = self.policy.get('max_completion_price_per_million')
+        if max_c_pm is not None and self.per_token_to_per_million(c_rate) > float(max_c_pm):
+            raise OpenRouterError('BLOCKED_PRICING', f'Completion price exceeds configured unit cap for {model_id}')
         return p_rate, c_rate, req_charge
 
     def _estimate_reservation_usd(
         self,
         role: str,
         model_id: str,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         explicit_usd: float | None,
         *,
         response_format: dict[str, Any] | None = None,
         allowed_tools: list[str] | None = None,
     ) -> tuple[float, dict[str, float]]:
         p_rate, c_rate, req_charge = self._resolve_pricing(role, model_id)
+        for msg in messages:
+            if not isinstance(msg, dict) or not isinstance(msg.get('content'), str):
+                raise OpenRouterError('BLOCKED_INPUT_UNBOUNDED', 'Only text-string message contents have a proven token bound')
         role_cfg = ((self.policy.get('roles') or {}).get(role) or {})
         max_tokens = int(role_cfg.get('maximum_output_tokens', 1024))
+        if max_tokens <= 0 or max_tokens > 32768:
+            raise OpenRouterError('BLOCKED_MODEL_CONFIGURATION', f'Invalid maximum_output_tokens={max_tokens}')
         serialized = json.dumps(
             {'messages': messages, 'response_format': response_format or {}, 'tools': allowed_tools or []},
             sort_keys=True,
             separators=(',', ':'),
         )
-        # Conservative byte/char upper-bound (1 token per 2 chars + framing overhead); not a BPE claim.
-        input_tokens_bound = math.ceil(len(serialized) / 2.0) + 128
+        # Provable UTF-8 byte upper-bound: every BPE token encodes >= 1 UTF-8 byte (+ 128 framing tokens).
+        utf8_bytes = len(serialized.encode('utf-8'))
+        input_tokens_bound = utf8_bytes + 128
+        role_lock = ((self.lock.get('roles') or {}).get(role) or {})
+        ctx_limit = role_lock.get('context_length') or self.lock.get('context_length')
+        if ctx_limit is not None and (input_tokens_bound + max_tokens) > int(ctx_limit):
+            raise OpenRouterError('BLOCKED_CONTEXT_LIMIT', f'Bound {input_tokens_bound + max_tokens} exceeds context_length {ctx_limit}')
         computed_bound = max(1e-6, round(input_tokens_bound * p_rate + max_tokens * c_rate + req_charge, 9))
         if explicit_usd is not None:
             est = float(explicit_usd)
@@ -171,6 +188,14 @@ class OpenRouterGateway:
             final_est = max(computed_bound, est)
         else:
             final_est = computed_bound
+        max_req_usd = self.policy.get('max_request_usd')
+        if max_req_usd is not None and final_est > float(max_req_usd):
+            raise OpenRouterError('BLOCKED_BUDGET', f'Request bound {final_est} exceeds max_request_usd {max_req_usd}')
+        max_key_spend = self.policy.get('max_key_spend_usd')
+        if max_key_spend is not None:
+            spent_now = float(self.budget.snapshot().get('project_spent_usd') or 0.0)
+            if spent_now + final_est > float(max_key_spend):
+                raise OpenRouterError('BLOCKED_BUDGET', 'Operator-approved key spend limit exceeded')
         max_price = {
             'prompt': self.per_token_to_per_million(p_rate),
             'completion': self.per_token_to_per_million(c_rate),
@@ -266,14 +291,17 @@ class OpenRouterGateway:
 
             body = resp.json()
             usage = body.get('usage') or {}
+            gen_id = body.get('id') or resp.headers.get('x-request-id')
             actual_cost = usage.get('cost')
             if actual_cost is None:
-                # Unknown cost is not zero: retain conservative estimate
-                self.budget.reconcile(res.reservation_id, actual_usd=res.reserved_usd)
-                recorded_cost = res.reserved_usd
+                # Missing provider cost MUST remain explicitly unresolved until reconciled; never settle as observed.
+                self.budget.reconcile(res.reservation_id, actual_usd=None, unknown_outcome=True, provider_request_id=gen_id)
+                recorded_cost: float | None = None
+                cost_status = 'UNRESOLVED'
             else:
                 recorded_cost = float(actual_cost)
-                self.budget.reconcile(res.reservation_id, actual_usd=recorded_cost)
+                self.budget.reconcile(res.reservation_id, actual_usd=recorded_cost, provider_request_id=gen_id)
+                cost_status = 'OBSERVED'
 
             content = (((body.get('choices') or [{}])[0]).get('message') or {}).get('content', '')
             try:
@@ -287,8 +315,11 @@ class OpenRouterGateway:
                 'requested_model': model_id,
                 'resolved_model': body.get('model'),
                 'provider': body.get('provider'),
+                'generation_id': gen_id,
+                'reservation_id': res.reservation_id,
                 'usage': usage,
                 'cost_usd': recorded_cost,
+                'cost_status': cost_status,
                 'observed_at': datetime.now(timezone.utc).isoformat(),
                 'output': validated.model_dump(mode='json'),
             }

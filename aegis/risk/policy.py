@@ -41,6 +41,8 @@ class OrderIntent(BaseModel):
     qty: float = Field(gt=0)
     order_type: Literal['market', 'limit'] = 'market'
     limit_price: float | None = Field(default=None, gt=0)
+    stop_price: float | None = Field(default=None, gt=0)
+    take_profit_price: float | None = Field(default=None, gt=0)
     time_in_force: Literal['day', 'gtc', 'ioc'] = 'day'
     strategy_version: str = 'v0.2'
     decision_evidence_ids: list[str] = Field(default_factory=list)
@@ -49,7 +51,7 @@ class OrderIntent(BaseModel):
     data_age_seconds: float = Field(ge=0.0)
     policy_version: str = 'quantshield_native_v1'
 
-    @field_validator('qty', 'limit_price', 'data_age_seconds')
+    @field_validator('qty', 'limit_price', 'stop_price', 'take_profit_price', 'data_age_seconds')
     @classmethod
     def _require_finite_float(cls, value: float | None) -> float | None:
         if value is not None and not math.isfinite(float(value)):
@@ -110,6 +112,8 @@ class RiskDecision(BaseModel):
     reasons: list[str]
     risk_reducing: bool = False
     policy_version: str
+    control_version: int = 1
+    profile_revision: int = 1
 
 
 class IndependentRiskGate:
@@ -125,7 +129,154 @@ class IndependentRiskGate:
         self._buy_reservations: dict[str, dict[str, Any]] = {}
         self._sell_reservations: dict[str, dict[str, Any]] = {}
         self._legacy_symbol_notional: dict[str, float] = {}
+        self._mem_control_state: dict[str, Any] = {
+            'halted': False,
+            'halt_reason': None,
+            'profile_id': self.profile.profile_id,
+            'profile_overrides': {},
+            'profile_revision': 1,
+            'control_version': 1,
+            'updated_at': datetime.now(timezone.utc).isoformat(),
+        }
+        self._ensure_schema()
         self._load_from_store()
+
+    def _ensure_schema(self) -> None:
+        if self._store is None:
+            return
+        with self._store.tx():
+            self._store.db.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS risk_control_state (
+                    scope_key TEXT PRIMARY KEY,
+                    halted INTEGER NOT NULL,
+                    halt_reason TEXT,
+                    profile_id TEXT NOT NULL,
+                    profile_overrides_json TEXT NOT NULL,
+                    profile_revision INTEGER NOT NULL,
+                    control_version INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                """
+            )
+            self._store.db.execute(
+                """
+                INSERT OR IGNORE INTO risk_control_state(
+                    scope_key, halted, halt_reason, profile_id, profile_overrides_json,
+                    profile_revision, control_version, updated_at
+                ) VALUES (?, 0, NULL, ?, '{}', 1, 1, ?)
+                """,
+                ('global', self.profile.profile_id, datetime.now(timezone.utc).isoformat()),
+            )
+
+    def _read_control_state_locked(self, scope_key: str = 'global') -> dict[str, Any]:
+        if self._store is None:
+            return dict(self._mem_control_state)
+        row = self._store.db.execute(
+            'SELECT * FROM risk_control_state WHERE scope_key = ?',
+            (scope_key,),
+        ).fetchone()
+        if row is None and scope_key != 'global':
+            row = self._store.db.execute(
+                'SELECT * FROM risk_control_state WHERE scope_key = ?',
+                ('global',),
+            ).fetchone()
+        if row is None:
+            return dict(self._mem_control_state)
+        import json as _json
+        overrides = _json.loads(row['profile_overrides_json']) if row['profile_overrides_json'] else {}
+        if overrides:
+            self.profile = self.profile.model_copy(update=overrides)
+        return {
+            'halted': bool(row['halted']),
+            'halt_reason': row['halt_reason'],
+            'profile_id': str(row['profile_id']),
+            'profile_overrides': overrides,
+            'profile_revision': int(row['profile_revision']),
+            'control_version': int(row['control_version']),
+            'updated_at': str(row['updated_at']),
+        }
+
+    def get_control_state(self, *, environment: str = '*', account_id: str = '*') -> dict[str, Any]:
+        with self._lock:
+            if self._store is None:
+                return dict(self._mem_control_state)
+            with self._store.lock:
+                return self._read_control_state_locked('global')
+
+    def set_halt(self, enabled: bool, *, reason: str | None = None, environment: str = '*', account_id: str = '*') -> dict[str, Any]:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            if self._store is None:
+                self._mem_control_state['halted'] = bool(enabled)
+                self._mem_control_state['halt_reason'] = reason if enabled else None
+                self._mem_control_state['control_version'] += 1
+                self._mem_control_state['updated_at'] = now_iso
+                return dict(self._mem_control_state)
+            with self._store.tx():
+                cur = self._read_control_state_locked('global')
+                new_ver = cur['control_version'] + 1
+                self._store.db.execute(
+                    """
+                    UPDATE risk_control_state
+                    SET halted = ?, halt_reason = ?, control_version = ?, updated_at = ?
+                    WHERE scope_key = 'global'
+                    """,
+                    (1 if enabled else 0, reason if enabled else None, new_ver, now_iso),
+                )
+                return self._read_control_state_locked('global')
+
+    def update_profile(self, changes: dict[str, Any]) -> dict[str, Any]:
+        allowed = {
+            'max_order_notional_pct',
+            'max_concentration_pct',
+            'max_gross_exposure_pct',
+            'max_daily_loss_pct',
+            'max_total_loss_pct',
+            'max_data_age_seconds',
+            'no_short_selling',
+        }
+        unknown = set(changes) - allowed
+        if unknown:
+            raise ValueError(f'UNSUPPORTED_POLICY_FIELD: {sorted(unknown)} cannot be applied to authoritative risk gate')
+        candidate = self.profile.model_copy(update=changes)
+        RiskProfile.model_validate(candidate.model_dump())
+        now_iso = datetime.now(timezone.utc).isoformat()
+        import json as _json
+        with self._lock:
+            self.profile = candidate
+            if self._store is None:
+                self._mem_control_state['profile_overrides'] = {**self._mem_control_state['profile_overrides'], **changes}
+                self._mem_control_state['profile_revision'] += 1
+                self._mem_control_state['control_version'] += 1
+                self._mem_control_state['updated_at'] = now_iso
+                return dict(self._mem_control_state)
+            with self._store.tx():
+                cur = self._read_control_state_locked('global')
+                merged = {**cur['profile_overrides'], **changes}
+                self._store.db.execute(
+                    """
+                    UPDATE risk_control_state
+                    SET profile_overrides_json = ?, profile_revision = ?, control_version = ?, updated_at = ?
+                    WHERE scope_key = 'global'
+                    """,
+                    (_json.dumps(merged, sort_keys=True), cur['profile_revision'] + 1, cur['control_version'] + 1, now_iso),
+                )
+                return self._read_control_state_locked('global')
+
+    def is_dispatch_allowed(self, intent: OrderIntent, decision: RiskDecision) -> tuple[bool, str | None]:
+        """Last-moment versioned dispatch fence checked inside DB transaction right before broker POST."""
+        if not decision.approved or decision.intent_hash != intent.intent_hash():
+            return False, 'INVALID_RISK_DECISION'
+        with self._lock:
+            ctrl = self._read_control_state_locked('global')
+            if ctrl['halted'] and not decision.risk_reducing:
+                return False, 'EMERGENCY_HALT_ACTIVE'
+            if ctrl['control_version'] != decision.control_version:
+                return False, 'CONTROL_VERSION_STALE'
+            if ctrl['profile_revision'] != decision.profile_revision:
+                return False, 'POLICY_REVISION_STALE'
+            return True, None
 
     @staticmethod
     def _order_key(account_id: str, environment: str, client_order_id: str) -> str:
@@ -183,9 +334,9 @@ class IndependentRiskGate:
         cash: float,
         positions: dict[str, float],
         marks: dict[str, float] | None = None,
-        daily_pnl_pct: float = 0.0,
-        total_drawdown_pct: float = 0.0,
-        halted: bool = False,
+        daily_pnl_pct: float | None = 0.0,
+        total_drawdown_pct: float | None = 0.0,
+        halted: bool | None = None,
         integrity_ok: bool = True,
         account_revision: int = 1,
         now: datetime | None = None,
@@ -229,9 +380,9 @@ class IndependentRiskGate:
         cash: float,
         positions: dict[str, float],
         marks: dict[str, float] | None,
-        daily_pnl_pct: float,
-        total_drawdown_pct: float,
-        halted: bool,
+        daily_pnl_pct: float | None,
+        total_drawdown_pct: float | None,
+        halted: bool | None,
         integrity_ok: bool,
         account_revision: int,
         now_utc: datetime,
@@ -243,6 +394,10 @@ class IndependentRiskGate:
     ) -> RiskDecision:
         if True:
             self._load_from_store()
+            ctrl = self._read_control_state_locked('global')
+            effective_halted = bool(halted) or bool(ctrl['halted'])
+            ctrl_ver = int(ctrl['control_version'])
+            prof_rev = int(ctrl['profile_revision'])
 
             existing = self._buy_reservations.get(order_key) or self._sell_reservations.get(order_key)
             if existing is not None:
@@ -255,6 +410,8 @@ class IndependentRiskGate:
                         reasons=[],
                         risk_reducing=bool(existing.get('risk_reducing', False)),
                         policy_version=self.profile.profile_id,
+                        control_version=ctrl_ver,
+                        profile_revision=prof_rev,
                     )
                 return RiskDecision(
                     approved=False,
@@ -264,6 +421,8 @@ class IndependentRiskGate:
                     reasons=['DUPLICATE_CLIENT_ORDER_ID'],
                     risk_reducing=False,
                     policy_version=self.profile.profile_id,
+                    control_version=ctrl_ver,
+                    profile_revision=prof_rev,
                 )
 
             held_raw = positions.get(sym, positions.get(intent.symbol, 0.0))
@@ -284,7 +443,7 @@ class IndependentRiskGate:
                 reasons.append('INTEGRITY_FAILED')
             checks.append('integrity')
 
-            if halted and not is_risk_reducing:
+            if effective_halted and not is_risk_reducing:
                 reasons.append('EMERGENCY_HALT_ACTIVE')
             checks.append('halt')
 
@@ -294,16 +453,19 @@ class IndependentRiskGate:
                 reasons.append('STALE_MARKET_DATA')
             checks.append('data_freshness')
 
+            loss_state_present = daily_pnl_pct is not None and total_drawdown_pct is not None
+            if not loss_state_present and not is_risk_reducing:
+                reasons.append('MISSING_ACCOUNT_LOSS_STATE')
+
             valuation_ok = (
                 _is_finite_positive(price)
                 and _is_finite_positive(equity)
                 and _is_finite_non_negative(cash)
                 and _is_finite_positive(intent.qty)
-                and _is_finite(daily_pnl_pct)
-                and _is_finite(total_drawdown_pct)
+                and (is_risk_reducing or (_is_finite(daily_pnl_pct) and _is_finite(total_drawdown_pct)))
                 and math.isfinite(held_qty)
             )
-            if not valuation_ok:
+            if not valuation_ok and (loss_state_present or is_risk_reducing):
                 reasons.append('INVALID_VALUATION')
             checks.append('valuation')
 
@@ -411,6 +573,8 @@ class IndependentRiskGate:
             reasons=reasons,
             risk_reducing=is_risk_reducing,
             policy_version=self.profile.profile_id,
+            control_version=ctrl_ver,
+            profile_revision=prof_rev,
         )
 
     def release_order_reservation(self, account_id: str, environment: str, client_order_id: str) -> None:

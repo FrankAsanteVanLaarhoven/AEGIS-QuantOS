@@ -47,6 +47,7 @@ class BudgetReservation:
     status: str  # RESERVED | SETTLED | RELEASED | UNKNOWN_OUTCOME
     originating_day: str
     actual_usd: float | None = None
+    provider_request_id: str | None = None
 
 
 class BudgetExceeded(ValueError):
@@ -87,7 +88,8 @@ class BudgetLedger:
                     originating_day TEXT NOT NULL,
                     reserved_nano INTEGER NOT NULL,
                     actual_nano INTEGER,
-                    status TEXT NOT NULL
+                    status TEXT NOT NULL,
+                    provider_request_id TEXT
                 );
                 CREATE TABLE IF NOT EXISTS budget_job_spent (
                     job_id TEXT PRIMARY KEY,
@@ -104,6 +106,63 @@ class BudgetLedger:
                 INSERT OR IGNORE INTO budget_project_spent(id, spent_nano) VALUES (1, 0);
                 """
             )
+            cols = {r['name'] for r in self._store.db.execute('PRAGMA table_info(budget_reservations)').fetchall()}
+            if 'provider_request_id' not in cols:
+                self._store.db.execute('ALTER TABLE budget_reservations ADD COLUMN provider_request_id TEXT')
+            self._migrate_legacy_kv_locked()
+
+    def _migrate_legacy_kv_locked(self) -> None:
+        kv_exists = self._store.db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='kv'"
+        ).fetchone()
+        if not kv_exists:
+            return
+        for legacy_key in ('llm_budget_v1', 'budget_ledger_v1', 'llm_budget'):
+            raw = self._store.get(legacy_key)
+            if raw is None:
+                continue
+            if not isinstance(raw, dict):
+                raise RuntimeError(f'MIGRATION_REQUIRED: legacy budget key {legacy_key} must be a JSON object')
+            if raw.get('_migrated_to_v2'):
+                continue
+            existing_res = self._store.db.execute('SELECT COUNT(*) AS c FROM budget_reservations').fetchone()
+            existing_proj = self._store.db.execute('SELECT spent_nano FROM budget_project_spent WHERE id = 1').fetchone()
+            if (existing_res and int(existing_res['c']) > 0) or (existing_proj and int(existing_proj['spent_nano']) > 0):
+                continue
+            try:
+                proj_nano = _to_nano_non_negative(float(raw.get('project_spent_usd', 0.0)), 'legacy project_spent_usd')
+                self._store.db.execute('UPDATE budget_project_spent SET spent_nano = ? WHERE id = 1', (proj_nano,))
+                for day_k, day_v in (raw.get('daily_spent') or {}).items():
+                    self._store.db.execute(
+                        'INSERT OR REPLACE INTO budget_daily_spent(day, spent_nano) VALUES (?, ?)',
+                        (str(day_k), _to_nano_non_negative(float(day_v), 'legacy daily_spent')),
+                    )
+                for job_k, job_v in (raw.get('job_spent') or {}).items():
+                    self._store.db.execute(
+                        'INSERT OR REPLACE INTO budget_job_spent(job_id, spent_nano) VALUES (?, ?)',
+                        (str(job_k), _to_nano_non_negative(float(job_v), 'legacy job_spent')),
+                    )
+                for rid, rec in (raw.get('reservations') or {}).items():
+                    if not isinstance(rec, dict):
+                        raise ValueError('Invalid legacy reservation entry')
+                    self._store.db.execute(
+                        'INSERT OR IGNORE INTO budget_reservations(reservation_id, job_id, originating_day, reserved_nano, actual_nano, status, provider_request_id) '
+                        'VALUES (?, ?, ?, ?, ?, ?, ?)',
+                        (
+                            str(rid),
+                            str(rec['job_id']),
+                            str(rec.get('originating_day') or self._today()),
+                            _to_nano_positive(float(rec['reserved_usd']), 'legacy reserved_usd'),
+                            _to_nano_non_negative(float(rec['actual_usd']), 'legacy actual_usd') if rec.get('actual_usd') is not None else None,
+                            str(rec.get('status') or 'UNKNOWN_OUTCOME'),
+                            rec.get('provider_request_id'),
+                        ),
+                    )
+                migrated = dict(raw)
+                migrated['_migrated_to_v2'] = True
+                self._store.put(legacy_key, migrated)
+            except Exception as exc:
+                raise RuntimeError(f'MIGRATION_REQUIRED: failed migrating legacy budget key {legacy_key}: {exc}') from exc
 
     def reserve(self, job_id: str, estimated_usd: float) -> BudgetReservation:
         est_nano = _to_nano_positive(estimated_usd, 'estimated_usd')
@@ -162,7 +221,14 @@ class BudgetLedger:
                     originating_day=day,
                 )
 
-    def reconcile(self, reservation_id: str, *, actual_usd: float | None, unknown_outcome: bool = False) -> BudgetReservation:
+    def reconcile(
+        self,
+        reservation_id: str,
+        *,
+        actual_usd: float | None,
+        unknown_outcome: bool = False,
+        provider_request_id: str | None = None,
+    ) -> BudgetReservation:
         actual_nano = _to_nano_non_negative(actual_usd, 'actual_usd') if actual_usd is not None else None
         with self._lock:
             with self._store.tx():
@@ -176,6 +242,7 @@ class BudgetLedger:
                 job_id = str(row['job_id'])
                 orig_day = str(row['originating_day'])
                 status = str(row['status'])
+                req_id = provider_request_id or row['provider_request_id']
 
                 if status in ('SETTLED', 'RELEASED'):
                     return BudgetReservation(
@@ -185,12 +252,13 @@ class BudgetLedger:
                         status=status,
                         originating_day=orig_day,
                         actual_usd=_nano_to_usd(int(row['actual_nano'])) if row['actual_nano'] is not None else None,
+                        provider_request_id=req_id,
                     )
 
                 if unknown_outcome or actual_nano is None:
                     self._store.db.execute(
-                        'UPDATE budget_reservations SET status = ?, actual_nano = ? WHERE reservation_id = ?',
-                        ('UNKNOWN_OUTCOME', reserved_nano, reservation_id),
+                        'UPDATE budget_reservations SET status = ?, actual_nano = NULL, provider_request_id = ? WHERE reservation_id = ?',
+                        ('UNKNOWN_OUTCOME', req_id, reservation_id),
                     )
                     return BudgetReservation(
                         reservation_id=reservation_id,
@@ -198,7 +266,8 @@ class BudgetLedger:
                         reserved_usd=_nano_to_usd(reserved_nano),
                         status='UNKNOWN_OUTCOME',
                         originating_day=orig_day,
-                        actual_usd=_nano_to_usd(reserved_nano),
+                        actual_usd=None,
+                        provider_request_id=req_id,
                     )
 
                 delta_nano = actual_nano - reserved_nano
@@ -215,8 +284,8 @@ class BudgetLedger:
                     (delta_nano,),
                 )
                 self._store.db.execute(
-                    'UPDATE budget_reservations SET status = ?, actual_nano = ? WHERE reservation_id = ?',
-                    ('SETTLED', actual_nano, reservation_id),
+                    'UPDATE budget_reservations SET status = ?, actual_nano = ?, provider_request_id = ? WHERE reservation_id = ?',
+                    ('SETTLED', actual_nano, req_id, reservation_id),
                 )
                 return BudgetReservation(
                     reservation_id=reservation_id,
@@ -225,6 +294,7 @@ class BudgetLedger:
                     status='SETTLED',
                     originating_day=orig_day,
                     actual_usd=_nano_to_usd(actual_nano),
+                    provider_request_id=req_id,
                 )
 
     def snapshot(self) -> dict[str, object]:

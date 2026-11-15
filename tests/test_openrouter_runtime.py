@@ -64,9 +64,9 @@ def _make_gateway(tmp_path: Path, handler, *, paid: bool = True, key: str | None
     lock_file.write_text(json.dumps({
         'schema_version': 1,
         'roles': {'filing_extractor': {
-            'model_id': 'openai/gpt-test-locked',
+            'model_id': 'provider/model-test-locked',
             'approved_fallbacks': [],
-            'pricing': {'prompt': '0.000002', 'completion': '0.000006'},
+            'pricing': {'prompt': '0.000002', 'completion': '0.000006', 'updated_at': datetime.now(timezone.utc).isoformat()},
         }},
     }), encoding='utf-8')
     env = {
@@ -87,8 +87,8 @@ def test_gateway_structured_success_and_privacy_flags(tmp_path: Path):
         body = json.loads(req.content)
         seen['provider'] = body['provider']
         return httpx.Response(200, json={
-            'model': 'openai/gpt-test-locked',
-            'provider': 'OpenAI',
+            'model': 'provider/model-test-locked',
+            'provider': 'ProviderA',
             'usage': {'prompt_tokens': 50, 'completion_tokens': 20, 'cost': 0.002},
             'choices': [{'message': {'content': json.dumps({
                 'symbol': 'NVDA',
@@ -185,9 +185,9 @@ def test_gateway_uses_pricing_from_lock_for_reservation(tmp_path: Path):
         'schema_version': 1,
         'roles': {
             'filing_extractor': {
-                'model_id': 'openai/gpt-test-locked',
+                'model_id': 'provider/model-test-locked',
                 'approved_fallbacks': [],
-                'pricing': {'prompt': '0.0001', 'completion': '0.0002'},
+                'pricing': {'prompt': '0.0001', 'completion': '0.0002', 'updated_at': datetime.now(timezone.utc).isoformat()},
             },
         },
     }), encoding='utf-8')
@@ -213,7 +213,7 @@ def test_f4_blocks_missing_or_stale_pricing_and_prevents_caller_undercut(tmp_pat
     lock_missing = tmp_path / 'lock_missing.json'
     lock_missing.write_text(json.dumps({
         'schema_version': 1,
-        'roles': {'filing_extractor': {'model_id': 'openai/gpt-test', 'approved_fallbacks': []}},
+        'roles': {'filing_extractor': {'model_id': 'provider/model-test', 'approved_fallbacks': []}},
     }), encoding='utf-8')
     called = {'n': 0}
 
@@ -222,7 +222,7 @@ def test_f4_blocks_missing_or_stale_pricing_and_prevents_caller_undercut(tmp_pat
         body = json.loads(req.content)
         called['provider'] = body['provider']
         return httpx.Response(200, json={
-            'model': 'openai/gpt-test',
+            'model': 'provider/model-test',
             'usage': {'cost': 0.002},
             'choices': [{'message': {'content': json.dumps({
                 'symbol': 'NVDA', 'period': '2026Q3', 'claims': ['ok'],
@@ -246,7 +246,7 @@ def test_f4_blocks_missing_or_stale_pricing_and_prevents_caller_undercut(tmp_pat
     lock_stale.write_text(json.dumps({
         'schema_version': 1,
         'roles': {'filing_extractor': {
-            'model_id': 'openai/gpt-test',
+            'model_id': 'provider/model-test',
             'approved_fallbacks': [],
             'pricing': {'prompt': '0.000002', 'completion': '0.000006', 'updated_at': '2020-01-01T00:00:00Z'},
         }},
@@ -267,9 +267,9 @@ def test_f4_blocks_missing_or_stale_pricing_and_prevents_caller_undercut(tmp_pat
     lock_ok.write_text(json.dumps({
         'schema_version': 1,
         'roles': {'filing_extractor': {
-            'model_id': 'openai/gpt-test',
+            'model_id': 'provider/model-test',
             'approved_fallbacks': [],
-            'pricing': {'prompt': '0.000002', 'completion': '0.000006'},
+            'pricing': {'prompt': '0.000002', 'completion': '0.000006', 'updated_at': datetime.now(timezone.utc).isoformat()},
         }},
     }), encoding='utf-8')
     gw_ok = OpenRouterGateway(

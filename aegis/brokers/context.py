@@ -22,6 +22,10 @@ class AccountSnapshot(BaseModel):
     positions: dict[str, float] = Field(default_factory=dict)
     open_orders_count: int = Field(default=0, ge=0)
     account_revision: int = Field(ge=1)
+    last_equity: float | None = Field(default=None, gt=0.0)
+    peak_equity: float | None = Field(default=None, gt=0.0)
+    daily_pnl_pct: float | None = None
+    total_drawdown_pct: float | None = Field(default=None, ge=0.0)
     reconciled_at: datetime
     integrity_ok: bool
 

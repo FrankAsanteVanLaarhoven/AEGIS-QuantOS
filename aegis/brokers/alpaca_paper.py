@@ -165,6 +165,8 @@ class AlpacaPaperOMS:
             raise ValueError('OrderIntent lacks valid matching RiskDecision')
         if intent.environment != 'paper_external':
             raise ValueError('AlpacaPaperOMS only accepts paper_external intents')
+        if intent.stop_price is not None or intent.take_profit_price is not None:
+            raise ValueError('UNSUPPORTED_PROTECTIVE_PARAMETERS: paper_external does not support protective stop/target bracket orders')
         if intent.order_type == 'limit' and intent.limit_price is None:
             raise ValueError('Limit order requires limit_price')
 
@@ -178,6 +180,11 @@ class AlpacaPaperOMS:
                     if existing.intent_hash != i_hash:
                         raise ValueError('IDEMPOTENCY_CONFLICT: client_order_id already exists with a different OrderIntent')
                     return existing
+                if self._risk_gate is not None:
+                    allowed, fence_reason = self._risk_gate.is_dispatch_allowed(intent, decision)
+                    if not allowed:
+                        self._risk_gate.release_order_reservation(intent.account_id, intent.environment, intent.client_order_id)
+                        raise ValueError(f'DISPATCH_FENCED: {fence_reason}')
 
                 now = datetime.now(timezone.utc)
                 rec = OrderOutboxRecord(
@@ -196,6 +203,19 @@ class AlpacaPaperOMS:
                 )
                 # Persist intent atomically BEFORE remote send
                 self._persist(rec)
+
+        # Last-moment dispatch fence immediately prior to outbound HTTP POST
+        if self._risk_gate is not None:
+            fence_tx = self._store.tx() if self._store is not None else nullcontext()
+            with self._lock, fence_tx:
+                allowed, fence_reason = self._risk_gate.is_dispatch_allowed(intent, decision)
+                if not allowed:
+                    rec.state = 'REJECTED'
+                    rec.last_error = f'DISPATCH_FENCED: {fence_reason}'
+                    rec.updated_at = datetime.now(timezone.utc)
+                    self._persist(rec)
+                    self._release_if_terminal(rec)
+                    raise ValueError(f'DISPATCH_FENCED: {fence_reason}')
 
         headers = self._headers()
         payload: dict[str, Any] = {
@@ -403,13 +423,36 @@ class AlpacaPaperOMS:
                 positions[sym] = qty
 
             integrity_ok = status == 'ACTIVE' and not bool(acc.get('trading_blocked', False))
+            last_equity: float | None = None
+            peak_equity: float | None = None
+            daily_pnl_pct: float | None = None
+            total_drawdown_pct: float | None = None
+            raw_last_eq = acc.get('last_equity')
+            if raw_last_eq is not None:
+                try:
+                    le = float(raw_last_eq)
+                    if math.isfinite(le) and le > 0:
+                        last_equity = le
+                        daily_pnl_pct = (equity - last_equity) / last_equity
+                except (TypeError, ValueError):
+                    last_equity = None
+
             with self._lock:
                 if self._store is not None:
                     with self._store.tx():
                         rev = int(self._store.get(f'acct_rev:{account_id}', 0)) + 1
                         self._store.put(f'acct_rev:{account_id}', rev)
+                        if last_equity is not None:
+                            stored_peak = self._store.get(f'acct_peak_equity:{account_id}')
+                            base_peak = float(stored_peak) if stored_peak is not None else max(equity, last_equity)
+                            peak_equity = max(base_peak, equity, last_equity)
+                            self._store.put(f'acct_peak_equity:{account_id}', peak_equity)
+                            total_drawdown_pct = max(0.0, (peak_equity - equity) / peak_equity)
                 else:
                     rev = 1
+                    if last_equity is not None:
+                        peak_equity = max(equity, last_equity)
+                        total_drawdown_pct = max(0.0, (peak_equity - equity) / peak_equity)
 
             return AccountSnapshot(
                 account_id=account_id,
@@ -422,6 +465,10 @@ class AlpacaPaperOMS:
                 positions=positions,
                 open_orders_count=len(ord_list),
                 account_revision=rev,
+                last_equity=last_equity,
+                peak_equity=peak_equity,
+                daily_pnl_pct=daily_pnl_pct,
+                total_drawdown_pct=total_drawdown_pct,
                 reconciled_at=datetime.now(timezone.utc),
                 integrity_ok=integrity_ok,
             )

@@ -34,8 +34,8 @@ def test_three_arm_evaluation_and_evidence_checker_rejects_hallucinated_citation
     lock.write_text(json.dumps({
         'schema_version': 1,
         'roles': {
-            'market_researcher': {'model_id': 'openai/gpt-test', 'approved_fallbacks': [], 'pricing': {'prompt': '0.000002', 'completion': '0.000006'}},
-            'hypothesis_author': {'model_id': 'openai/gpt-test', 'approved_fallbacks': [], 'pricing': {'prompt': '0.000002', 'completion': '0.000006'}},
+            'market_researcher': {'model_id': 'provider/model-test', 'approved_fallbacks': [], 'pricing': {'prompt': '0.000002', 'completion': '0.000006', 'updated_at': now.isoformat()}},
+            'hypothesis_author': {'model_id': 'provider/model-test', 'approved_fallbacks': [], 'pricing': {'prompt': '0.000002', 'completion': '0.000006', 'updated_at': now.isoformat()}},
         },
     }), encoding='utf-8')
     settings = AegisSettings.from_env({'AEGIS_ENABLE_PAID_LLM': 'true', 'AEGIS_OPENROUTER_MODELS_LOCK': str(lock)})
@@ -50,7 +50,7 @@ def test_three_arm_evaluation_and_evidence_checker_rejects_hallucinated_citation
         if 'hypothesis_author' in body['response_format']['json_schema']['name']:
             # Simulate a hallucinated citation ID in arm 3 -> evidence_checker must reject it!
             return httpx.Response(200, json={
-                'model': 'openai/gpt-test',
+                'model': 'provider/model-test',
                 'usage': {'cost': 0.001},
                 'choices': [{'message': {'content': json.dumps({
                     'symbol': 'NVDA',
@@ -63,7 +63,7 @@ def test_three_arm_evaluation_and_evidence_checker_rejects_hallucinated_citation
                 })}}],
             })
         return httpx.Response(200, json={
-            'model': 'openai/gpt-test',
+            'model': 'provider/model-test',
             'usage': {'cost': 0.001},
             'choices': [{'message': {'content': json.dumps({
                 'symbol': 'NVDA',

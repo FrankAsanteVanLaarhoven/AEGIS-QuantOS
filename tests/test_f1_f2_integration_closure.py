@@ -88,6 +88,7 @@ def _mock_broker_transport(
                 'currency': 'USD',
                 'cash': cash,
                 'equity': equity,
+                'last_equity': equity,
                 'buying_power': cash,
             })
         if req.method == 'GET' and path == '/v2/positions':

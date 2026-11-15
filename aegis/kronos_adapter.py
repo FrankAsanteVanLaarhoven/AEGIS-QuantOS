@@ -63,11 +63,12 @@ def load():
             _cached=(key,predictor); return predictor,m
         except Exception as exc: raise ModelUnavailable('Kronos load failed: '+str(exc)) from exc
 
-def forecast(dataset,index,symbol,horizon=12,samples=4,seed=26,use_exchange_calendar=False):
+def forecast(dataset,index,symbol,horizon=12,samples=4,seed=26,use_exchange_calendar=False,bar_minutes=None):
     if symbol not in dataset.symbols or not 1<=horizon<=60 or not 2<=samples<=16: raise ValueError('Invalid forecast bounds')
     bars=dataset.prefix(symbol,index)
     if use_exchange_calendar:
-        future_ts=[ts.isoformat() for ts in forward_bar_timestamps(dt(bars[-1]['timestamp']),horizon,bar_minutes=15)]
+        bm=int(bar_minutes or getattr(dataset,'bar_minutes',15))
+        future_ts=[ts.isoformat() for ts in forward_bar_timestamps(dt(bars[-1]['timestamp']),horizon,bar_minutes=bm)]
     elif index+horizon>=dataset.length:
         raise ValueError('Not enough declared future calendar timestamps; shorten horizon or pass use_exchange_calendar=True')
     else:

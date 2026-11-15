@@ -1,6 +1,7 @@
 from __future__ import annotations
 import asyncio, hmac, json, os, secrets, time
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
@@ -20,7 +21,7 @@ from . import kronos_adapter as kronos
 from .connectors import connector_status, sec_filings, alpaca_read
 from .settings import build_runtime_context
 from .doctor import run_doctor
-from .market.read_model import MarketReadModel
+from .market.read_model import LiveForecastSeries, MIN_LIVE_FORECAST_BARS, MarketReadModel
 from .market.supervisor import MarketDataSupervisor
 from .providers.alpaca_market import AlpacaMarketAdapter
 from .providers.evidence import EvidenceStore
@@ -158,13 +159,19 @@ def create_app(db_path=None,token=None):
     @app.get('/api/state')
     def state():
         snap=service.snapshot()
+        ctrl=risk_gate.get_control_state(environment=settings.execution_mode)
+        snap['execution_mode']=settings.execution_mode
+        snap['control_state']=ctrl
+        if settings.execution_mode=='paper_external' and ctrl['halted']:
+            snap['halted']=True
+            snap['halt_reason']=ctrl['halt_reason']
         if settings.data_mode!='synthetic':
             sup=supervisor.status()
             msnap=market_read_model.snapshot(source_mode=settings.data_mode,feed=settings.alpaca_data_feed,feed_state=str(sup['state']),max_age_seconds=risk_gate.profile.max_data_age_seconds)
             snap['mode']=f'{settings.data_mode.upper()}_MARKET'
             snap['data_status']=sup['state']
             snap['dataset']['source']=f'market_read_model:{settings.data_mode}'
-            snap['scanner']=market_read_model.scanner(source_mode=settings.data_mode)
+            snap['scanner']=market_read_model.scanner(source_mode=settings.data_mode,feed=settings.alpaca_data_feed)
             snap['market_snapshot']=msnap.model_dump(mode='json')
         return snap
     @app.get('/api/market/feed/status')
@@ -173,8 +180,8 @@ def create_app(db_path=None,token=None):
     def market(symbol:str):
         sym=symbol.upper()
         if settings.data_mode!='synthetic':
-            bars=market_read_model.bars(sym,source_mode=settings.data_mode,limit=240)
-            return {'symbol':sym,'source':f'market_read_model:{settings.data_mode}','source_mode':settings.data_mode,'status':supervisor.status()['state'],'bars':bars,'asof':bars[-1]['time'] if bars else None}
+            bars=market_read_model.bars(sym,source_mode=settings.data_mode,feed=settings.alpaca_data_feed,limit=240)
+            return {'symbol':sym,'source':f'market_read_model:{settings.data_mode}','source_mode':settings.data_mode,'status':supervisor.status()['state'],'bars':bars,'asof':bars[-1]['timestamp'] if bars else None}
         with service.store.lock:
             s=service.s()
             if symbol not in service.dataset.symbols: raise ValueError('Unknown symbol')
@@ -182,31 +189,43 @@ def create_app(db_path=None,token=None):
     @app.post('/api/orders')
     def order(body:Order):
         if settings.execution_mode=='paper_external':
-            from datetime import datetime,timedelta,timezone
+            if body.stop is not None or body.target is not None:
+                raise ValueError('UNSUPPORTED_PROTECTIVE_PARAMETERS: paper_external does not support protective stop/target bracket orders')
             if settings.data_mode=='synthetic':
                 raise ValueError('MARKET_INTEGRITY_FAILED: synthetic market data cannot authorize paper_external orders')
             now=datetime.now(timezone.utc)
             sup=supervisor.status(now)
             msnap=market_read_model.snapshot(source_mode=settings.data_mode,feed=settings.alpaca_data_feed,feed_state=str(sup['state']),max_age_seconds=risk_gate.profile.max_data_age_seconds,now=now)
-            if not msnap.integrity_ok:
-                raise ValueError(f"MARKET_INTEGRITY_FAILED: feed={msnap.feed_state} marks={len(msnap.marks)}")
             sym=body.symbol.upper()
             mark=msnap.marks.get(sym)
-            if mark is None or mark.stale or mark.age_seconds is None or mark.price<=0:
+            if mark is None or mark.price<=0:
+                if not msnap.integrity_ok:
+                    raise ValueError(f"MARKET_INTEGRITY_FAILED: feed={msnap.feed_state} marks={len(msnap.marks)}")
                 raise ValueError(f'STALE_OR_MISSING_MARK: {sym}')
             acct=paper_oms.fetch_account_snapshot()
             if not acct.integrity_ok:
                 raise ValueError(f'EXTERNAL_ACCOUNT_UNHEALTHY: status={acct.status}')
+            if not msnap.integrity_ok and body.side!='SELL':
+                raise ValueError(f"MARKET_INTEGRITY_FAILED: feed={msnap.feed_state} marks={len(msnap.marks)}")
+            if mark.stale or mark.age_seconds is None:
+                if body.side!='SELL':
+                    raise ValueError(f'STALE_OR_MISSING_MARK: {sym}')
             auth_ctx=OrderAuthorizationContext(account=acct,market=msnap,policy_version=risk_gate.profile.profile_id)
-            intent=OrderIntent(account_id=acct.account_id,environment='paper_external',symbol=sym,side=body.side,qty=float(body.qty),order_type=body.order_type,limit_price=body.limit_price,client_order_id=body.client_id,expires_at=now+timedelta(minutes=5),data_age_seconds=float(mark.age_seconds),policy_version=risk_gate.profile.profile_id)
+            data_age=float(mark.age_seconds) if mark.age_seconds is not None else float(risk_gate.profile.max_data_age_seconds+1.0)
+            intent=OrderIntent(account_id=acct.account_id,environment='paper_external',symbol=sym,side=body.side,qty=float(body.qty),order_type=body.order_type,limit_price=body.limit_price,stop_price=body.stop,take_profit_price=body.target,client_order_id=body.client_id,expires_at=now+timedelta(minutes=5),data_age_seconds=data_age,policy_version=risk_gate.profile.profile_id)
             marks_dict={s:m.price for s,m in msnap.marks.items()}
-            decision=risk_gate.evaluate(intent,price=mark.price,equity=acct.equity,cash=acct.cash,positions=acct.positions,marks=marks_dict,halted=False,integrity_ok=acct.integrity_ok and msnap.integrity_ok,account_revision=acct.account_revision,now=now)
+            decision=risk_gate.evaluate(intent,price=mark.price,equity=acct.equity,cash=acct.cash,positions=acct.positions,marks=marks_dict,daily_pnl_pct=acct.daily_pnl_pct,total_drawdown_pct=acct.total_drawdown_pct,halted=None,integrity_ok=acct.integrity_ok and msnap.integrity_ok,account_revision=acct.account_revision,now=now)
             if not decision.approved or decision.intent_hash!=intent.intent_hash():
                 raise ValueError('RISK_REJECTED: '+','.join(decision.reasons))
             return {'mode':'paper_external','authorization_context':auth_ctx.model_dump(mode='json'),'decision':decision.model_dump(mode='json'),'order':paper_oms.submit_order(intent,decision).model_dump(mode='json')}
+        if body.order_type!='market' or body.limit_price is not None:
+            raise ValueError('UNSUPPORTED_ORDER_TYPE: paper_local simulation only supports market orders without limit_price')
         return service.submit(**body.model_dump(exclude={'order_type','limit_price'}))
     @app.post('/api/orders/{ident}/cancel')
-    def cancel(ident:str):return service.cancel(ident)
+    def cancel(ident:str):
+        if settings.execution_mode=='paper_external':
+            return paper_oms.cancel_order(ident).model_dump(mode='json')
+        return service.cancel(ident)
     @app.post('/api/replay/step')
     def step(body:Step):return service.advance(body.count)
     @app.post('/api/research/cycle')
@@ -214,9 +233,18 @@ def create_app(db_path=None,token=None):
     @app.post('/api/config')
     def config(body:Config):return service.configure(body.model_dump(exclude_none=True))
     @app.post('/api/risk/halt')
-    def halt(body:Halt):return service.halt(body.enabled)
+    def halt(body:Halt):
+        ctrl=risk_gate.set_halt(body.enabled,reason='OPERATOR_HALT' if body.enabled else None)
+        snap=service.halt(body.enabled)
+        snap['control_state']=ctrl
+        snap['execution_mode']=settings.execution_mode
+        return snap
     @app.post('/api/risk/policy')
-    def policy(body:dict):return service.policy(body)
+    def policy(body:dict):
+        if settings.execution_mode=='paper_external':
+            ctrl=risk_gate.update_profile(body)
+            return {'execution_mode':'paper_external','profile':risk_gate.profile.model_dump(mode='json'),'control_state':ctrl}
+        return service.policy(body)
     @app.post('/api/reset')
     def reset(body:Reset):
         if body.confirm!='RESET PAPER SESSION': raise ValueError('Explicit reset confirmation required')
@@ -249,12 +277,16 @@ def create_app(db_path=None,token=None):
         try:
             if settings.data_mode!='synthetic':
                 sym=body.symbol.upper()
-                bars=market_read_model.bars(sym,source_mode=settings.data_mode,limit=240)
-                if len(bars)<24: raise ValueError(f'INSUFFICIENT_LIVE_BARS: need at least 24 bars for {sym}, have {len(bars)}')
-                rows=[{'symbol':sym,'time':b['time'],'open':b['open'],'high':b['high'],'low':b['low'],'close':b['close'],'volume':b['volume']} for b in bars]
-                ds=Dataset(rows=rows,label=f'{sym} {settings.data_mode} read-model',source=f'market_read_model:{settings.data_mode}')
-                result=kronos.forecast(ds,len(bars)-1,**body.model_dump())
+                now_utc=datetime.now(timezone.utc)
+                bars=market_read_model.bars(sym,source_mode=settings.data_mode,feed=settings.alpaca_data_feed,as_of=now_utc,limit=240)
+                tf=bars[-1]['timeframe'] if bars else '1Min'
+                ds=LiveForecastSeries(symbol=sym,bars=bars,source_mode=settings.data_mode,timeframe=tf,as_of=now_utc,min_bars=MIN_LIVE_FORECAST_BARS)
+                result=kronos.forecast(ds,ds.length-1,**body.model_dump(),use_exchange_calendar=True,bar_minutes=ds.bar_minutes)
                 result['input_bar_hashes']=[b['raw_payload_hash'] for b in bars[-10:]]
+                result['timeframe']=tf
+                result['provider']=bars[-1]['provider']
+                result['feed']=bars[-1]['feed']
+                result['source_mode']=settings.data_mode
             else:
                 s=service.s(); result=kronos.forecast(service.dataset,s['index'],**body.model_dump())
             with service.store.tx(): result=service.store.result('forecast',result); service.store.append('model.forecast_completed',{'id':result['id'],'model':result['model'],'execution_eligible':result['execution_eligible']})

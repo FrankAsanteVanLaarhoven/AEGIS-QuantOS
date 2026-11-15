@@ -28,6 +28,7 @@ class MarketEvent(BaseModel):
     provider: str = Field(min_length=1)
     feed: Literal['iex', 'sip', 'synthetic', 'historical'] = 'iex'
     source_mode: Literal['live', 'delayed', 'historical', 'synthetic'] = 'live'
+    timeframe: str = '1Min'
     provider_ts: datetime
     receive_ts: datetime
     available_at: datetime
