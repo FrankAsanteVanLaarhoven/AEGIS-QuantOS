@@ -31,6 +31,8 @@ add_library(aq_engine STATIC
     src/model.cpp
     src/rl.cpp
     src/inference_abi.cpp
+    src/oms.cpp
+    src/service.cpp
 )
 target_include_directories(aq_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(aq_engine PUBLIC aq_core SQLite::SQLite3 OpenSSL::Crypto Threads::Threads)

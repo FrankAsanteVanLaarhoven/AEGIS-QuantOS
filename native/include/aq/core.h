@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define AQ_CORE_ABI_VERSION 1u
+#define AQ_CORE_ABI_VERSION 2u
 #define AQ_MAX_SYMBOL_LEN 16u
 #define AQ_MAX_REASONS 12u
 
@@ -51,7 +51,8 @@ typedef enum aq_reason_bit_t {
     AQ_REJ_UNSUPPORTED_PROTECTION = 1u << 11,
     AQ_REJ_UNSUPPORTED_UNIT = 1u << 12,
     AQ_REJ_INVALID_VALUATION = 1u << 13,
-    AQ_REJ_MISSING_MARK = 1u << 14
+    AQ_REJ_MISSING_MARK = 1u << 14,
+    AQ_REJ_DUPLICATE_POSITION = 1u << 15
 } aq_reason_bit_t;
 
 /* Explicit instrument unit & scale contract (v1 supports USD cents + whole shares). */
@@ -71,6 +72,13 @@ typedef struct aq_position_mark_t {
     int64_t mark_cents;     /* Price in USD cents (> 0) */
 } aq_position_mark_t;
 
+typedef struct aq_symbol_reservation_t {
+    char symbol[AQ_MAX_SYMBOL_LEN];
+    int64_t reserved_buy_cents;
+    int64_t reserved_buy_qty;
+    int64_t reserved_sell_qty;
+} aq_symbol_reservation_t;
+
 typedef struct aq_account_snapshot_t {
     uint32_t abi_version;
     uint32_t struct_size;
@@ -85,6 +93,8 @@ typedef struct aq_account_snapshot_t {
     uint8_t integrity_ok;
     uint32_t position_count;
     const aq_position_mark_t* positions;
+    uint32_t reservation_count;
+    const aq_symbol_reservation_t* reservations;
 } aq_account_snapshot_t;
 
 typedef struct aq_risk_policy_t {
@@ -129,6 +139,7 @@ typedef struct aq_risk_decision_t {
 aq_status_t aq_checked_add_i64(int64_t a, int64_t b, int64_t* out);
 aq_status_t aq_checked_sub_i64(int64_t a, int64_t b, int64_t* out);
 aq_status_t aq_checked_mul_i64(int64_t a, int64_t b, int64_t* out);
+aq_status_t aq_checked_abs_i64(int64_t a, int64_t* out);
 
 /* Validate instrument scale/currency contract. */
 aq_status_t aq_validate_instrument(const aq_instrument_spec_t* spec);

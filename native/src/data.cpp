@@ -241,4 +241,31 @@ void write_csv_file(const std::string& path, const Dataset& ds) {
     ofs << to_csv(ds);
 }
 
+ChronologicalSplit split_dataset_chronological(const Dataset& ds, double train_frac) {
+    if (train_frac <= 0.1 || train_frac >= 0.9) {
+        throw std::invalid_argument("train_frac must be in (0.1, 0.9)");
+    }
+    if (ds.bars.size() < 130) {
+        throw std::invalid_argument("Dataset too short to split into >=65-bar disjoint train/eval ranges");
+    }
+    size_t cut = static_cast<size_t>(std::floor(static_cast<double>(ds.bars.size()) * train_frac));
+    if (cut < 65 || (ds.bars.size() - cut) < 65) {
+        throw std::invalid_argument("Split produces <65 bars in train or eval");
+    }
+    if (ds.bars[cut - 1].close_epoch_s >= ds.bars[cut].open_epoch_s) {
+        throw std::invalid_argument("Split boundary is not strictly chronologically disjoint");
+    }
+    ChronologicalSplit out;
+    out.train.symbol = ds.symbol;
+    out.train.source = ds.source;
+    out.train.bars.assign(ds.bars.begin(), ds.bars.begin() + static_cast<std::ptrdiff_t>(cut));
+    out.train.dataset_hash = sha256_hex(to_csv(out.train));
+
+    out.eval.symbol = ds.symbol;
+    out.eval.source = ds.source;
+    out.eval.bars.assign(ds.bars.begin() + static_cast<std::ptrdiff_t>(cut), ds.bars.end());
+    out.eval.dataset_hash = sha256_hex(to_csv(out.eval));
+    return out;
+}
+
 }  // namespace aq

@@ -11,7 +11,7 @@
 namespace aq {
 
 namespace {
-constexpr char kMagic[8] = {'A', 'Q', 'C', 'P', 'v', '0', '0', '1'};
+constexpr char kMagic[8] = {'A', 'Q', 'C', 'P', 'v', '0', '0', '2'};
 
 void xavier_init(std::mt19937_64& rng, double* dst, size_t fan_in, size_t fan_out, double gain = 1.0) {
     double bound = gain * std::sqrt(6.0 / static_cast<double>(fan_in + fan_out));
@@ -225,8 +225,11 @@ std::string ActorCritic::save_checkpoint(const std::string& path) const {
 
     write_u32(feature_version);
     write_u32(action_version);
+    write_u32(optimizer_format);
     write_u64(update_count);
     write_str(dataset_hash);
+    write_str(split_tag);
+    write_str(config_hash);
     write_str(rng_state_serialized);
     write_str(env_state_serialized);
     write_u64(actor_adam_.t);
@@ -299,8 +302,14 @@ ActorCritic ActorCritic::load_checkpoint(const std::string& path, std::string* o
     ActorCritic ac(0);
     ac.feature_version = read_u32();
     ac.action_version = read_u32();
+    ac.optimizer_format = read_u32();
+    if (ac.optimizer_format != 1) {
+        throw std::runtime_error("Unsupported optimizer format in checkpoint");
+    }
     ac.update_count = read_u64();
     ac.dataset_hash = read_str();
+    ac.split_tag = read_str();
+    ac.config_hash = read_str();
     ac.rng_state_serialized = read_str();
     ac.env_state_serialized = read_str();
     ac.actor_adam_.t = read_u64();
@@ -312,6 +321,27 @@ ActorCritic ActorCritic::load_checkpoint(const std::string& path, std::string* o
     ac.critic_adam_.m = read_vec(kCriticParamCount);
     ac.critic_adam_.v = read_vec(kCriticParamCount);
     if (pos != raw.size()) throw std::runtime_error("Trailing bytes in checkpoint");
+    return ac;
+}
+
+ActorCritic ActorCritic::init_transfer_from(
+    const ActorCritic& source,
+    uint64_t new_seed,
+    const std::string& new_dataset_hash,
+    const std::string& new_config_hash,
+    const std::string& new_split_tag) {
+    ActorCritic ac(new_seed);
+    ac.feature_version = source.feature_version;
+    ac.action_version = source.action_version;
+    ac.optimizer_format = 1;
+    ac.actor_p_ = source.actor_p_;
+    ac.critic_p_ = source.critic_p_;
+    ac.dataset_hash = new_dataset_hash;
+    ac.config_hash = new_config_hash;
+    ac.split_tag = new_split_tag;
+    ac.update_count = 0;
+    ac.rng_state_serialized.clear();
+    ac.env_state_serialized.clear();
     return ac;
 }
 

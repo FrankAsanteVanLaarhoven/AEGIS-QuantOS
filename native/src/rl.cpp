@@ -99,13 +99,28 @@ std::array<double, kObsDim> CausalEnv::reset(size_t start_idx) {
     cash_cents_ = cfg_.initial_cash_cents;
     shares_ = 0;
     peak_equity_cents_ = cfg_.initial_cash_cents;
+    session_day_ = ds_.bars[idx_].close_epoch_s / 86400;
+    day_start_equity_cents_ = cfg_.initial_cash_cents;
     prev_drawdown_ = 0.0;
     acct_rev_ = 1;
+    halted_ = cfg_.halted;
+    control_epoch_ = cfg_.control_epoch;
     return build_causal_obs(ds_, idx_, shares_, cash_cents_, peak_equity_cents_);
 }
 
+void CausalEnv::set_control_state(bool halted, uint64_t control_epoch) {
+    halted_ = halted;
+    control_epoch_ = control_epoch;
+}
+
 int64_t CausalEnv::equity_cents() const {
-    return cash_cents_ + shares_ * ds_.bars[idx_].close_cents;
+    int64_t pos_val = 0;
+    int64_t eq = 0;
+    if (aq_checked_mul_i64(shares_, ds_.bars[idx_].close_cents, &pos_val) != AQ_OK ||
+        aq_checked_add_i64(cash_cents_, pos_val, &eq) != AQ_OK) {
+        throw std::overflow_error("CausalEnv equity_cents overflow");
+    }
+    return eq;
 }
 
 StepOutcome CausalEnv::step(uint32_t action) {
@@ -113,15 +128,35 @@ StepOutcome CausalEnv::step(uint32_t action) {
     static constexpr double kTargets[kActionCount] = {0.0, 0.25, 0.50};
 
     int64_t eq_now = equity_cents();
+    int64_t bar_day = ds_.bars[idx_].close_epoch_s / 86400;
+    if (bar_day != session_day_) {
+        session_day_ = bar_day;
+        day_start_equity_cents_ = eq_now;
+    }
     int64_t px_close = ds_.bars[idx_].close_cents;
     double target_notional = static_cast<double>(eq_now) * kTargets[action];
     int64_t target_shares = static_cast<int64_t>(std::floor(target_notional / static_cast<double>(px_close)));
-    int64_t delta_shares = target_shares - shares_;
+    int64_t delta_shares = 0;
+    if (aq_checked_sub_i64(target_shares, shares_, &delta_shares) != AQ_OK) {
+        throw std::overflow_error("delta_shares overflow");
+    }
 
     bool risk_rejected = false;
     int64_t executed_delta = 0;
 
     if (delta_shares != 0) {
+        int64_t abs_delta = 0;
+        if (aq_checked_abs_i64(delta_shares, &abs_delta) != AQ_OK) {
+            throw std::overflow_error("abs_delta overflow");
+        }
+        int64_t pnl_diff = 0;
+        int64_t pnl_scaled = 0;
+        if (aq_checked_sub_i64(eq_now, day_start_equity_cents_, &pnl_diff) != AQ_OK ||
+            aq_checked_mul_i64(pnl_diff, 10000, &pnl_scaled) != AQ_OK) {
+            throw std::overflow_error("daily_pnl_bps overflow");
+        }
+        int64_t daily_pnl_bps = pnl_scaled / std::max<int64_t>(1, day_start_equity_cents_);
+
         aq_position_mark_t pm{};
         std::snprintf(pm.symbol, sizeof(pm.symbol), "%s", ds_.symbol.c_str());
         pm.qty = shares_;
@@ -133,14 +168,16 @@ StepOutcome CausalEnv::step(uint32_t action) {
         acct.cash_cents = cash_cents_;
         acct.equity_cents = eq_now;
         acct.reserved_buy_cents = 0;
-        acct.daily_pnl_bps = 0;
+        acct.daily_pnl_bps = daily_pnl_bps;
         acct.total_drawdown_bps = static_cast<int64_t>(std::llround(prev_drawdown_ * 10000.0));
         acct.account_revision = acct_rev_;
-        acct.control_epoch = 1;
-        acct.halted = 0;
+        acct.control_epoch = control_epoch_;
+        acct.halted = halted_ ? 1u : 0u;
         acct.integrity_ok = 1;
         acct.position_count = shares_ > 0 ? 1u : 0u;
         acct.positions = shares_ > 0 ? &pm : nullptr;
+        acct.reservation_count = 0;
+        acct.reservations = nullptr;
 
         aq_order_intent_t intent{};
         intent.abi_version = AQ_CORE_ABI_VERSION;
@@ -148,8 +185,8 @@ StepOutcome CausalEnv::step(uint32_t action) {
         std::snprintf(intent.symbol, sizeof(intent.symbol), "%s", ds_.symbol.c_str());
         intent.side = delta_shares > 0 ? AQ_SIDE_BUY : AQ_SIDE_SELL;
         intent.order_type = AQ_ORDER_MARKET;
-        intent.qty = delta_shares > 0 ? delta_shares : -delta_shares;
-        intent.price_cents = ds_.bars[idx_ + 1].open_cents;
+        intent.qty = abs_delta;
+        intent.price_cents = px_close;  // Causal pre-trade check uses decision-time close, never future open!
         intent.data_age_ms = 0;
 
         aq_risk_decision_t dec{};
@@ -161,14 +198,32 @@ StepOutcome CausalEnv::step(uint32_t action) {
         } else {
             int64_t raw_open = ds_.bars[idx_ + 1].open_cents;
             int64_t adv_bps = cfg_.half_spread_bps + cfg_.slippage_bps;
-            int64_t fill_px = delta_shares > 0
-                ? (raw_open * (10000 + adv_bps) + 9999) / 10000
-                : (raw_open * (10000 - adv_bps)) / 10000;
-            int64_t notional = intent.qty * fill_px;
-            int64_t fee = (notional * cfg_.commission_bps + 9999) / 10000;
+            int64_t mult = delta_shares > 0 ? (10000 + adv_bps) : (10000 - adv_bps);
+            int64_t px_num = 0;
+            if (aq_checked_mul_i64(raw_open, mult, &px_num) != AQ_OK) {
+                throw std::overflow_error("fill_px overflow");
+            }
+            int64_t fill_px = delta_shares > 0 ? (px_num + 9999) / 10000 : px_num / 10000;
+            int64_t notional = 0;
+            int64_t fee_num = 0;
+            if (aq_checked_mul_i64(intent.qty, fill_px, &notional) != AQ_OK ||
+                aq_checked_mul_i64(notional, cfg_.commission_bps, &fee_num) != AQ_OK) {
+                throw std::overflow_error("execution notional/fee overflow");
+            }
+            int64_t fee = (fee_num + 9999) / 10000;
             if (delta_shares > 0) {
-                if (notional + fee <= cash_cents_) {
-                    cash_cents_ -= (notional + fee);
+                int64_t total_cost = 0;
+                if (aq_checked_add_i64(notional, fee, &total_cost) != AQ_OK) {
+                    throw std::overflow_error("total_cost overflow");
+                }
+                // Execution-time check against gapped open fill price.
+                intent.price_cents = fill_px;
+                aq_risk_decision_t exec_dec{};
+                exec_dec.abi_version = AQ_CORE_ABI_VERSION;
+                exec_dec.struct_size = sizeof(aq_risk_decision_t);
+                aq_status_t exec_st = aq_evaluate_risk(&spec_, &acct, &cfg_.risk_policy, &intent, &exec_dec);
+                if (exec_st == AQ_OK && exec_dec.approved && total_cost <= cash_cents_) {
+                    cash_cents_ -= total_cost;
                     shares_ += intent.qty;
                     executed_delta = intent.qty;
                     acct_rev_ += 1;
@@ -176,7 +231,11 @@ StepOutcome CausalEnv::step(uint32_t action) {
                     risk_rejected = true;
                 }
             } else {
-                cash_cents_ += (notional - fee);
+                int64_t net_proceeds = 0;
+                if (aq_checked_sub_i64(notional, fee, &net_proceeds) != AQ_OK) {
+                    throw std::overflow_error("net_proceeds overflow");
+                }
+                cash_cents_ += net_proceeds;
                 shares_ -= intent.qty;
                 executed_delta = -intent.qty;
                 acct_rev_ += 1;
@@ -210,16 +269,22 @@ std::string CausalEnv::serialize_state() const {
     uint64_t dd_bits = 0;
     std::memcpy(&dd_bits, &prev_drawdown_, sizeof(dd_bits));
     std::ostringstream oss;
-    oss << idx_ << " " << cash_cents_ << " " << shares_ << " " << peak_equity_cents_ << " " << dd_bits << " " << acct_rev_;
+    oss << idx_ << " " << cash_cents_ << " " << shares_ << " " << peak_equity_cents_ << " "
+        << session_day_ << " " << day_start_equity_cents_ << " " << dd_bits << " "
+        << acct_rev_ << " " << (halted_ ? 1 : 0) << " " << control_epoch_;
     return oss.str();
 }
 
 std::array<double, kObsDim> CausalEnv::restore_state(const std::string& state) {
     std::istringstream iss(state);
     uint64_t dd_bits = 0;
-    if (!(iss >> idx_ >> cash_cents_ >> shares_ >> peak_equity_cents_ >> dd_bits >> acct_rev_)) {
+    int halted_int = 0;
+    if (!(iss >> idx_ >> cash_cents_ >> shares_ >> peak_equity_cents_ >>
+          session_day_ >> day_start_equity_cents_ >> dd_bits >> acct_rev_ >>
+          halted_int >> control_epoch_)) {
         throw std::runtime_error("Invalid CausalEnv serialized state");
     }
+    halted_ = (halted_int != 0);
     std::memcpy(&prev_drawdown_, &dd_bits, sizeof(prev_drawdown_));
     return build_causal_obs(ds_, idx_, shares_, cash_cents_, peak_equity_cents_);
 }
@@ -239,12 +304,16 @@ void compute_gae(
         size_t t = n - 1 - rev;
         const auto& tr = traj[t];
         double next_val = 0.0;
-        double non_terminal = tr.terminated ? 0.0 : 1.0;
-        if (t + 1 < n) {
+        if (tr.terminated) {
+            next_val = 0.0;
+        } else if (tr.truncated) {
+            next_val = tr.bootstrap_value;
+        } else if (t + 1 < n) {
             next_val = traj[t + 1].value;
         } else {
-            next_val = tr.terminated ? 0.0 : last_bootstrap_value;
+            next_val = last_bootstrap_value;
         }
+        double non_terminal = tr.terminated ? 0.0 : 1.0;
         double delta = tr.reward + gamma * next_val * non_terminal - tr.value;
         double carry = (tr.terminated || tr.truncated) ? 0.0 : (gamma * gae_lambda);
         gae = delta + carry * gae;
@@ -253,15 +322,52 @@ void compute_gae(
     }
 }
 
+std::string sim_config_hash(const SimConfig& scfg, const TrainConfig& tcfg) {
+    std::ostringstream oss;
+    oss << scfg.initial_cash_cents << "|" << scfg.half_spread_bps << "|" << scfg.slippage_bps << "|"
+        << scfg.commission_bps << "|" << scfg.warmup_bars << "|"
+        << scfg.risk_policy.max_order_notional_bps << "|"
+        << scfg.risk_policy.max_concentration_bps << "|"
+        << scfg.risk_policy.max_gross_exposure_bps << "|"
+        << scfg.risk_policy.max_daily_loss_bps << "|"
+        << scfg.risk_policy.max_total_loss_bps << "|"
+        << scfg.risk_policy.max_data_age_ms << "|"
+        << static_cast<int>(scfg.risk_policy.no_short_selling) << "|"
+        << static_cast<int>(scfg.risk_policy.allow_protective_brackets) << "|"
+        << tcfg.gamma << "|" << tcfg.gae_lambda << "|" << tcfg.clip_eps << "|"
+        << tcfg.vf_coef << "|" << tcfg.ent_coef << "|" << tcfg.lr << "|"
+        << tcfg.rollout_steps << "|" << tcfg.ppo_epochs << "|" << tcfg.minibatch_size;
+    return sha256_hex(oss.str());
+}
+
 TrainSummary train_ppo(
     const Dataset& ds,
     const std::string& out_dir,
     const TrainConfig& tcfg,
     const SimConfig& scfg,
-    const std::string& resume_checkpoint) {
+    const std::string& resume_checkpoint,
+    const std::string& split_tag) {
     std::filesystem::create_directories(out_dir);
+    std::string expected_cfg_hash = sim_config_hash(scfg, tcfg);
     ActorCritic ac = resume_checkpoint.empty() ? ActorCritic(tcfg.seed) : ActorCritic::load_checkpoint(resume_checkpoint);
-    ac.dataset_hash = ds.dataset_hash;
+    if (!resume_checkpoint.empty()) {
+        if (ac.feature_version != 1 || ac.action_version != 1 || ac.optimizer_format != 1) {
+            throw std::runtime_error("Incompatible checkpoint schema/optimizer format for resume");
+        }
+        if (ac.dataset_hash != ds.dataset_hash) {
+            throw std::runtime_error("Checkpoint dataset_hash mismatch on resume");
+        }
+        if (ac.split_tag != split_tag) {
+            throw std::runtime_error("Checkpoint split_tag mismatch on resume");
+        }
+        if (ac.config_hash != expected_cfg_hash) {
+            throw std::runtime_error("Checkpoint reward/cost config_hash mismatch on resume");
+        }
+    } else {
+        ac.dataset_hash = ds.dataset_hash;
+        ac.split_tag = split_tag;
+        ac.config_hash = expected_cfg_hash;
+    }
 
     std::mt19937_64 rng(tcfg.seed + 1000);
     if (!ac.rng_state_serialized.empty()) {
@@ -286,7 +392,11 @@ TrainSummary train_ppo(
             double lp = std::log(std::max(af.probs[act], 1e-12));
 
             StepOutcome so = env.step(act);
-            traj.push_back(GaeTransition{obs, act, lp, cf.value, so.reward, so.terminated, so.truncated});
+            double bootstrap_val = 0.0;
+            if (so.truncated && !so.terminated) {
+                bootstrap_val = ac.forward_critic(so.next_obs).value;
+            }
+            traj.push_back(GaeTransition{obs, act, lp, cf.value, so.reward, bootstrap_val, so.terminated, so.truncated});
             total_transitions += 1;
             if (so.terminated || so.truncated) {
                 obs = env.reset(scfg.warmup_bars);

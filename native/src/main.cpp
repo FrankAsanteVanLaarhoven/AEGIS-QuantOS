@@ -1,9 +1,18 @@
 #include "aq/data.hpp"
 #include "aq/rl.hpp"
+#include "aq/service.hpp"
 
+#include <atomic>
+#include <csignal>
 #include <cstdlib>
 #include <iostream>
 #include <string>
+#include <thread>
+
+namespace {
+std::atomic<bool> g_stop_serve{false};
+void on_sig(int) { g_stop_serve.store(true); }
+}
 
 int main(int argc, char** argv) {
     try {
@@ -53,6 +62,41 @@ int main(int argc, char** argv) {
                       << ",\"risk_interventions\":" << rec.risk_interventions
                       << ",\"trades_executed\":" << rec.trades_executed
                       << ",\"execution_authorized\":0}\n";
+            return 0;
+        }
+        if (cmd == "shadow") {
+            if (argc < 4) return 2;
+            std::string ckpt_hash;
+            auto model = aq::ActorCritic::load_checkpoint(argv[2], &ckpt_hash);
+            auto ds = aq::load_csv_file(argv[3], "SYNTHETIC");
+            auto rep = aq::run_shadow_parity_check(ds, aq::default_sim_config(), &model, ckpt_hash);
+            std::cout << "{\"command\":\"shadow\",\"exact_accounting_parity\":" << (rep.exact_accounting_parity ? "true" : "false")
+                      << ",\"exact_verdict_parity\":" << (rep.exact_verdict_parity ? "true" : "false")
+                      << ",\"steps_compared\":" << rep.steps_compared
+                      << ",\"native_final_equity_cents\":" << rep.native_final_equity_cents
+                      << ",\"receipt_hash\":\"" << rep.native_receipt_hash << "\"}\n";
+            return (rep.exact_accounting_parity && rep.exact_verdict_parity) ? 0 : 1;
+        }
+        if (cmd == "serve") {
+            if (argc < 5) return 2;
+            aq::ServiceConfig scfg;
+            scfg.db_path = argv[2];
+            scfg.host = argv[3];
+            scfg.port = static_cast<uint16_t>(std::stoul(argv[4]));
+            const char* tok_env = std::getenv("AEGIS_API_TOKEN");
+            scfg.auth_token = (argc >= 6) ? argv[5] : (tok_env ? tok_env : "dev-native-token");
+            aq::NativeHttpServer srv(scfg);
+            srv.load_dataset(aq::generate_synthetic_dataset(240, 26));
+            srv.start();
+            std::signal(SIGINT, on_sig);
+            std::signal(SIGTERM, on_sig);
+            std::cout << "{\"command\":\"serve\",\"host\":\"" << scfg.host
+                      << "\",\"port\":" << srv.bound_port() << ",\"live_execution\":false}\n"
+                      << std::flush;
+            while (!g_stop_serve.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            srv.stop();
             return 0;
         }
         return 2;

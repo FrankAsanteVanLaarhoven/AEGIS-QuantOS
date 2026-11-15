@@ -37,5 +37,12 @@ Dataset generate_synthetic_dataset(size_t count, uint64_t seed, const std::strin
 std::string to_csv(const Dataset& ds);
 void write_csv_file(const std::string& path, const Dataset& ds);
 
+struct ChronologicalSplit {
+    Dataset train;
+    Dataset eval;
+};
+
+ChronologicalSplit split_dataset_chronological(const Dataset& ds, double train_frac = 0.7);
+
 }  // namespace aq
 

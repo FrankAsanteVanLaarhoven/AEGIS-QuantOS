@@ -2,8 +2,15 @@
 #include "aq/data.hpp"
 #include "aq/inference.h"
 #include "aq/model.hpp"
+#include "aq/oms.hpp"
 #include "aq/rl.hpp"
+#include "aq/service.hpp"
 #include "aq/storage.hpp"
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <cstdlib>
@@ -310,11 +317,11 @@ int main() {
     });
     run_check("gae_truncation_bootstraps_and_resets_carry", [] {
         std::vector<aq::GaeTransition> tr(2);
-        tr[0].reward = 1.0; tr[0].value = 0.5; tr[0].truncated = true;
-        tr[1].reward = 2.0; tr[1].value = 0.4; tr[1].truncated = false;
+        tr[0].reward = 1.0; tr[0].value = 0.5; tr[0].bootstrap_value = 0.4; tr[0].truncated = true;
+        tr[1].reward = 2.0; tr[1].value = 99.0; tr[1].truncated = false;
         std::vector<double> adv, ret;
         aq::compute_gae(tr, 1.0, 0.99, 0.95, adv, ret);
-        // At t=0 (truncated), carry from t=1 is 0, bootstrap uses tr[1].value
+        // At t=0 (truncated), carry from t=1 is 0, bootstrap uses tr[0].bootstrap_value (never reset tr[1].value)
         double expected_a0 = 1.0 + 0.99 * 0.4 - 0.5;
         AQ_CHECK(std::abs(adv[0] - expected_a0) < 1e-12);
     });
@@ -486,6 +493,298 @@ int main() {
         bool threw = false;
         try { aq::CausalEnv env(ds); } catch (...) { threw = true; }
         AQ_CHECK(threw);
+    });
+    run_check("b1_int64_min_position_rejected_without_ubsan", [] {
+        auto spec = make_spec("NVDA");
+        aq_position_mark_t pos{};
+        std::snprintf(pos.symbol, sizeof(pos.symbol), "NVDA");
+        pos.qty = std::numeric_limits<int64_t>::min();
+        pos.mark_cents = 10000;
+        auto acct = make_acct();
+        acct.cash_cents = 100000;
+        acct.equity_cents = 100000;
+        acct.position_count = 1;
+        acct.positions = &pos;
+        auto pol = make_policy();
+        auto intent = make_intent("NVDA", AQ_SIDE_BUY, 1, 10000);
+        aq_risk_decision_t dec{};
+        dec.abi_version = AQ_CORE_ABI_VERSION;
+        dec.struct_size = sizeof(dec);
+        AQ_CHECK(aq_evaluate_risk(&spec, &acct, &pol, &intent, &dec) == AQ_ERR_OVERFLOW);
+        AQ_CHECK(dec.approved == 0);
+    });
+    run_check("b1_policy_tick_duplicate_position_and_symbol_bounds", [] {
+        auto spec = make_spec("NVDA");
+        spec.tick_size = 5;
+        auto acct = make_acct();
+        acct.cash_cents = 100000;
+        acct.equity_cents = 100000;
+        auto pol = make_policy();
+        auto bad_tick = make_intent("NVDA", AQ_SIDE_BUY, 1, 10002);
+        auto dec = eval_risk(spec, acct, pol, bad_tick);
+        AQ_CHECK(dec.approved == 0 && (dec.reason_mask & AQ_REJ_INVALID_VALUATION));
+
+        aq_position_mark_t dups[2]{};
+        std::snprintf(dups[0].symbol, sizeof(dups[0].symbol), "NVDA");
+        dups[0].qty = 1; dups[0].mark_cents = 10000;
+        std::snprintf(dups[1].symbol, sizeof(dups[1].symbol), "NVDA");
+        dups[1].qty = 2; dups[1].mark_cents = 10000;
+        acct.position_count = 2;
+        acct.positions = dups;
+        auto ok_tick = make_intent("NVDA", AQ_SIDE_BUY, 1, 10000);
+        aq_risk_decision_t out{};
+        out.struct_size = sizeof(out);
+        AQ_CHECK(aq_evaluate_risk(&spec, &acct, &pol, &ok_tick, &out) == AQ_ERR_INVALID_ARG);
+        AQ_CHECK(out.approved == 0 && (out.reason_mask & AQ_REJ_DUPLICATE_POSITION));
+    });
+    run_check("b2_pending_same_symbol_concentration_and_cross_symbol_control", [] {
+        auto pol = make_policy();
+        pol.max_order_notional_bps = 2500;  // 25%
+        pol.max_concentration_bps = 3500;   // 35%
+        pol.max_gross_exposure_bps = 9000;  // 90%
+
+        aq_symbol_reservation_t res{};
+        std::snprintf(res.symbol, sizeof(res.symbol), "NVDA");
+        res.reserved_buy_cents = 25000;  // $250 pending buy in NVDA
+        res.reserved_buy_qty = 25;
+
+        auto acct = make_acct();
+        acct.cash_cents = 100000;
+        acct.equity_cents = 100000;  // $1,000 equity
+        acct.reserved_buy_cents = 25000;
+        acct.reservation_count = 1;
+        acct.reservations = &res;
+
+        // Same symbol: $250 pending + $250 proposed = 50% > 35% -> REJECTED
+        auto dec_same = eval_risk(make_spec("NVDA"), acct, pol, make_intent("NVDA", AQ_SIDE_BUY, 25, 1000));
+        AQ_CHECK(dec_same.approved == 0 && (dec_same.reason_mask & AQ_REJ_CONCENTRATION_LIMIT));
+
+        // Different symbol control: $250 pending NVDA + $250 proposed AAPL = 25% AAPL <= 35%, 50% gross <= 90% -> APPROVED
+        auto dec_other = eval_risk(make_spec("AAPL"), acct, pol, make_intent("AAPL", AQ_SIDE_BUY, 25, 1000));
+        AQ_CHECK(dec_other.approved == 1 && dec_other.reason_mask == AQ_REJ_NONE);
+    });
+    run_check("b3_gae_truncation_bootstraps_pre_reset_final_obs", [] {
+        // r=1, V(current)=2, gamma=0.99, V(final)=10, V(reset)=100 -> adv=8.9 (never 98)
+        std::vector<aq::GaeTransition> traj(2);
+        traj[0].value = 2.0;
+        traj[0].reward = 1.0;
+        traj[0].bootstrap_value = 10.0;
+        traj[0].terminated = false;
+        traj[0].truncated = true;
+        traj[1].value = 100.0;  // Next episode reset observation
+        traj[1].reward = 0.0;
+        traj[1].terminated = true;
+        traj[1].truncated = false;
+        std::vector<double> adv, ret;
+        aq::compute_gae(traj, 999.0, 0.99, 0.95, adv, ret);
+        AQ_CHECK(std::abs(adv[0] - 8.9) < 1e-12);
+        AQ_CHECK(std::abs(ret[0] - 10.9) < 1e-12);
+
+        // Last-row truncation case
+        std::vector<aq::GaeTransition> last_row(1);
+        last_row[0].value = 2.0;
+        last_row[0].reward = 1.0;
+        last_row[0].bootstrap_value = 10.0;
+        last_row[0].terminated = false;
+        last_row[0].truncated = true;
+        aq::compute_gae(last_row, 100.0, 0.99, 0.95, adv, ret);
+        AQ_CHECK(std::abs(adv[0] - 8.9) < 1e-12);
+    });
+    run_check("b4_resume_compatibility_and_transfer_init", [&] {
+        auto ds = aq::generate_synthetic_dataset(240, 26);
+        auto split = aq::split_dataset_chronological(ds, 0.7);
+        AQ_CHECK(split.train.bars.back().close_epoch_s < split.eval.bars.front().open_epoch_s);
+        AQ_CHECK(split.train.dataset_hash != split.eval.dataset_hash);
+
+        aq::TrainConfig cfg;
+        cfg.seed = 26;
+        cfg.updates = 2;
+        cfg.rollout_steps = 32;
+        auto sum = aq::train_ppo(split.train, tmp_dir + "/b4_train", cfg, aq::default_sim_config(), "", "train");
+
+        // Incompatible dataset must fail closed on resume
+        bool threw_ds = false;
+        try {
+            aq::train_ppo(split.eval, tmp_dir + "/b4_bad_ds", cfg, aq::default_sim_config(), sum.checkpoint_path, "train");
+        } catch (...) {
+            threw_ds = true;
+        }
+        AQ_CHECK(threw_ds);
+
+        // Incompatible cost/reward config must fail closed on resume
+        auto bad_scfg = aq::default_sim_config();
+        bad_scfg.commission_bps += 10;
+        bool threw_cfg = false;
+        try {
+            aq::train_ppo(split.train, tmp_dir + "/b4_bad_cfg", cfg, bad_scfg, sum.checkpoint_path, "train");
+        } catch (...) {
+            threw_cfg = true;
+        }
+        AQ_CHECK(threw_cfg);
+
+        // Explicit transfer-learning init preserves weights and resets Adam/env
+        auto loaded = aq::ActorCritic::load_checkpoint(sum.checkpoint_path);
+        auto xfer = aq::ActorCritic::init_transfer_from(
+            loaded, 99, split.eval.dataset_hash, aq::sim_config_hash(bad_scfg, cfg), "train");
+        AQ_CHECK(xfer.actor_params() == loaded.actor_params());
+        AQ_CHECK(xfer.update_count == 0 && xfer.env_state_serialized.empty());
+    });
+    run_check("b5_causal_env_halt_epoch_and_gapped_fill", [] {
+        auto ds = aq::generate_synthetic_dataset(100, 26);
+        aq::CausalEnv env(ds);
+        env.set_control_state(true, 7);
+        auto so = env.step(2);  // Try to buy 50% while halted
+        AQ_CHECK(so.risk_rejected && so.executed_shares_delta == 0);
+
+        // Gapped open price exceeding cash/notional is rejected at execution time
+        auto gapped = ds;
+        gapped.bars[17].open_cents = gapped.bars[16].close_cents * 10;
+        aq::CausalEnv env_gap(gapped);
+        auto so_gap = env_gap.step(2);
+        AQ_CHECK(so_gap.risk_rejected && so_gap.executed_shares_delta == 0);
+    });
+    run_check("c1_native_http_service_auth_csrf_and_tcp_socket", [&] {
+        aq::ServiceConfig scfg;
+        scfg.db_path = tmp_dir + "/n3_srv.sqlite";
+        scfg.auth_token = "test-secret-token";
+        scfg.enable_paper_writer = false;
+        aq::NativeHttpServer srv(scfg);
+        srv.load_dataset(aq::generate_synthetic_dataset(100, 26));
+
+        // Unauthenticated /api/state -> 401
+        auto r_unauth = srv.handle_request({"GET", "/api/state", {}, ""});
+        AQ_CHECK(r_unauth.status_code == 401);
+
+        // /api/health and /api/ready
+        auto r_health = srv.handle_request({"GET", "/api/health", {}, ""});
+        AQ_CHECK(r_health.status_code == 200 && r_health.body.find("native_cpp") != std::string::npos);
+        auto r_ready = srv.handle_request({"GET", "/api/ready", {}, ""});
+        AQ_CHECK(r_ready.status_code == 200 && r_ready.body.find("\"dataset_loaded\":true") != std::string::npos);
+
+        // /api/login invalid -> 401, valid -> 200 + Set-Cookie + csrf
+        auto r_bad_login = srv.handle_request({"POST", "/api/login", {}, "{\"token\":\"wrong\"}"});
+        AQ_CHECK(r_bad_login.status_code == 401);
+        auto r_login = srv.handle_request({"POST", "/api/login", {}, "{\"token\":\"test-secret-token\"}"});
+        AQ_CHECK(r_login.status_code == 200 && r_login.headers.count("Set-Cookie"));
+        std::string cookie = r_login.headers["Set-Cookie"];
+        std::string sid = cookie.substr(0, cookie.find(';'));
+        size_t cpos = r_login.body.find("\"csrf\":\"") + 8;
+        std::string csrf = r_login.body.substr(cpos, r_login.body.find('"', cpos) - cpos);
+
+        // Cookie without CSRF on POST /api/risk/halt -> 401; with CSRF -> 200
+        auto r_nocsrf = srv.handle_request({"POST", "/api/risk/halt", {{"Cookie", sid}}, "{\"action\":\"halt\"}"});
+        AQ_CHECK(r_nocsrf.status_code == 401);
+        auto r_halt = srv.handle_request({"POST", "/api/risk/halt", {{"Cookie", sid}, {"X-CSRF-Token", csrf}}, "{\"action\":\"halt\",\"reason\":\"test\"}"});
+        AQ_CHECK(r_halt.status_code == 200 && r_halt.body.find("\"halted\":true") != std::string::npos);
+
+        // Authenticated /api/market/NVDA and /api/training/jobs
+        auto r_mkt = srv.handle_request({"GET", "/api/market/NVDA", {{"Cookie", sid}}, ""});
+        AQ_CHECK(r_mkt.status_code == 200 && r_mkt.body.find("available_at") != std::string::npos);
+        auto r_job = srv.handle_request({"POST", "/api/training/jobs", {{"Cookie", sid}, {"X-CSRF-Token", csrf}}, "{\"updates\":1}"});
+        AQ_CHECK(r_job.status_code == 200 && r_job.body.find("\"status\":\"COMPLETED\"") != std::string::npos);
+
+        // Real POSIX TCP socket roundtrip
+        srv.start();
+        AQ_CHECK(srv.bound_port() > 0);
+        int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        AQ_CHECK(fd >= 0);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(srv.bound_port());
+        ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+        AQ_CHECK(::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+        const char* req_wire = "GET /api/health HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        AQ_CHECK(::send(fd, req_wire, std::strlen(req_wire), 0) > 0);
+        char buf[2048]{};
+        ssize_t n = ::recv(fd, buf, sizeof(buf) - 1, 0);
+        ::close(fd);
+        srv.stop();
+        AQ_CHECK(n > 0 && std::string(buf, static_cast<size_t>(n)).find("200 OK") != std::string::npos);
+    });
+    run_check("c2_oms_idempotency_crash_recovery_partial_and_fill", [&] {
+        aq::NativeOms oms(tmp_dir + "/n3_oms.sqlite");
+        oms.init_account("paper_native", 100000, 100000);
+        oms.acquire_writer_lease("paper_native", "w1", 1);
+        auto spec = make_spec("NVDA");
+        auto pol = make_policy();
+        auto intent = make_intent("NVDA", AQ_SIDE_BUY, 10, 2000);  // $200
+
+        auto s1 = oms.submit_intent("paper_native", "cid-1", spec, intent, pol);
+        AQ_CHECK(s1.accepted_for_reservation && !s1.duplicate_idempotent);
+        auto s2 = oms.submit_intent("paper_native", "cid-1", spec, intent, pol);
+        AQ_CHECK(s2.duplicate_idempotent && s2.order.client_order_id == "cid-1");
+
+        // Crash before transport -> DISPATCHED_UNKNOWN with reservation intact
+        auto crashed = oms.dispatch_reserved("paper_native", "cid-1", "w1", 1, pol,
+            [](const aq::OmsOrderRecord&) { return aq::DispatchOutcome{}; }, true);
+        AQ_CHECK(crashed.state == aq::OrderState::DISPATCHED_UNKNOWN && crashed.reserved_cash_cents > 0);
+        AQ_CHECK(oms.recover_in_flight("paper_native").size() == 1);
+
+        // Partial fill 5 of 10, then full fill 10 of 10
+        auto p1 = oms.reconcile_order("cid-1", {aq::OrderState::PARTIAL, "brk-1", 5, 2000, 10, "partial_5"});
+        AQ_CHECK(p1.state == aq::OrderState::PARTIAL && p1.filled_qty == 5 && p1.reserved_cash_cents > 0);
+        auto p2 = oms.reconcile_order("cid-1", {aq::OrderState::FILLED, "brk-1", 10, 2000, 10, "filled_10"});
+        AQ_CHECK(p2.state == aq::OrderState::FILLED && p2.filled_qty == 10 && p2.reserved_cash_cents == 0);
+        auto snap = oms.account_snapshot("paper_native");
+        AQ_CHECK(snap.cash_cents == 100000 - 20000 - 20);
+        AQ_CHECK(snap.positions.size() == 1 && snap.positions[0].qty == 10);
+    });
+    run_check("c2_c5_halt_race_and_writer_lease_fencing", [&] {
+        aq::NativeOms oms(tmp_dir + "/n3_fence.sqlite");
+        oms.init_account("paper_native", 100000, 100000);
+        oms.acquire_writer_lease("paper_native", "w1", 1);
+        auto spec = make_spec("NVDA");
+        auto pol = make_policy();
+        auto sub = oms.submit_intent("paper_native", "cid-halt", spec, make_intent("NVDA", AQ_SIDE_BUY, 10, 2000), pol);
+        AQ_CHECK(sub.accepted_for_reservation);
+
+        // Stale writer epoch blocked
+        bool blocked = false;
+        try {
+            oms.dispatch_reserved("paper_native", "cid-halt", "w1", 99, pol,
+                [](const aq::OmsOrderRecord&) { return aq::DispatchOutcome{}; });
+        } catch (...) {
+            blocked = true;
+        }
+        AQ_CHECK(blocked);
+
+        // Halt before dispatch -> REJECTED without transport
+        oms.halt("paper_native", "manual_halt");
+        bool transport_called = false;
+        auto rec = oms.dispatch_reserved("paper_native", "cid-halt", "w1", 1, pol,
+            [&](const aq::OmsOrderRecord&) {
+                transport_called = true;
+                return aq::DispatchOutcome{aq::OrderState::ACCEPTED, "b", 0, 0, 0, ""};
+            });
+        AQ_CHECK(!transport_called && rec.state == aq::OrderState::REJECTED && rec.reserved_cash_cents == 0);
+    });
+    run_check("gate4_oms_100_concurrent_reservations_no_concentration_breach", [&] {
+        aq::NativeOms oms(tmp_dir + "/n3_conc.sqlite");
+        oms.init_account("paper_native", 100000, 100000);  // $1,000
+        auto spec = make_spec("NVDA");
+        auto pol = make_policy();
+        pol.max_order_notional_bps = 2500;
+        pol.max_concentration_bps = 3500;  // Max $350 in NVDA
+
+        std::atomic<int> approved{0};
+        std::vector<std::thread> ths;
+        for (int t = 0; t < 4; ++t) {
+            ths.emplace_back([&, t]() {
+                for (int k = 0; k < 25; ++k) {
+                    std::string cid = "c-" + std::to_string(t) + "-" + std::to_string(k);
+                    auto res = oms.submit_intent("paper_native", cid, spec, make_intent("NVDA", AQ_SIDE_BUY, 25, 1000), pol);
+                    if (res.accepted_for_reservation) approved.fetch_add(1);
+                }
+            });
+        }
+        for (auto& th : ths) th.join();
+        AQ_CHECK(approved.load() == 1);  // Only 1x $250 fits under 35% ($350) concentration cap!
+    });
+    run_check("c4_shadow_parity_exact_accounting_and_verdict", [] {
+        auto ds = aq::generate_synthetic_dataset(160, 26);
+        aq::ActorCritic ac(26);
+        auto rep = aq::run_shadow_parity_check(ds, aq::default_sim_config(), &ac, "shadow26");
+        AQ_CHECK(rep.exact_accounting_parity && rep.exact_verdict_parity && rep.steps_compared > 0);
     });
 
     std::cout << "ALL_NATIVE_CHECKS_PASSED: " << g_passed << "\n";

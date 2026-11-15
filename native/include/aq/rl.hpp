@@ -17,6 +17,8 @@ struct SimConfig {
     int64_t slippage_bps = 4;
     int64_t commission_bps = 5;
     size_t warmup_bars = 16;
+    bool halted = false;
+    uint64_t control_epoch = 1;
     aq_risk_policy_t risk_policy{};
 };
 
@@ -41,12 +43,18 @@ struct StepOutcome {
     int64_t shares = 0;
 };
 
+/*
+ * Causal trading environment. Finite dataset endings are artificial cutoffs
+ * (truncated = true, terminated = false), not genuine terminal absorbing states,
+ * so GAE must bootstrap from the pre-reset final observation.
+ */
 class CausalEnv {
 public:
     CausalEnv(const Dataset& ds, SimConfig cfg = default_sim_config());
 
     std::array<double, kObsDim> reset(size_t start_idx = 16);
     StepOutcome step(uint32_t action);
+    void set_control_state(bool halted, uint64_t control_epoch);
     std::string serialize_state() const;
     std::array<double, kObsDim> restore_state(const std::string& state);
 
@@ -63,8 +71,12 @@ private:
     int64_t cash_cents_ = 0;
     int64_t shares_ = 0;
     int64_t peak_equity_cents_ = 0;
+    int64_t session_day_ = 0;
+    int64_t day_start_equity_cents_ = 0;
     double prev_drawdown_ = 0.0;
     uint64_t acct_rev_ = 1;
+    bool halted_ = false;
+    uint64_t control_epoch_ = 1;
 };
 
 struct GaeTransition {
@@ -73,6 +85,7 @@ struct GaeTransition {
     double log_prob = 0.0;
     double value = 0.0;
     double reward = 0.0;
+    double bootstrap_value = 0.0;  // V(s_final) before reset when truncated=true
     bool terminated = false;
     bool truncated = false;
 };
@@ -109,12 +122,15 @@ struct TrainSummary {
     std::string checkpoint_hash;
 };
 
+std::string sim_config_hash(const SimConfig& scfg, const TrainConfig& tcfg);
+
 TrainSummary train_ppo(
     const Dataset& ds,
     const std::string& out_dir,
     const TrainConfig& tcfg = TrainConfig{},
     const SimConfig& scfg = default_sim_config(),
-    const std::string& resume_checkpoint = "");
+    const std::string& resume_checkpoint = "",
+    const std::string& split_tag = "train");
 
 struct ReplayReceipt {
     std::string dataset_hash;

@@ -73,9 +73,19 @@ public:
     uint64_t update_count = 0;
     uint32_t feature_version = 1;
     uint32_t action_version = 1;
+    uint32_t optimizer_format = 1;
     std::string dataset_hash;
+    std::string split_tag = "train";
+    std::string config_hash;
     std::string rng_state_serialized;
     std::string env_state_serialized;
+
+    static ActorCritic init_transfer_from(
+        const ActorCritic& source,
+        uint64_t new_seed,
+        const std::string& new_dataset_hash,
+        const std::string& new_config_hash,
+        const std::string& new_split_tag = "train");
 
     std::string save_checkpoint(const std::string& path) const;
     static ActorCritic load_checkpoint(const std::string& path, std::string* out_file_hash = nullptr);
