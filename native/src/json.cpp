@@ -77,16 +77,53 @@ private:
         }
     }
 
+    static uint32_t parse_hex4(const std::string& s, size_t& pos) {
+        if (pos + 4 > s.size()) throw std::runtime_error("Invalid unicode escape");
+        uint32_t cp = 0;
+        for (int i = 0; i < 4; ++i) {
+            char h = s[pos++];
+            cp <<= 4;
+            if (h >= '0' && h <= '9') cp |= static_cast<uint32_t>(h - '0');
+            else if (h >= 'a' && h <= 'f') cp |= static_cast<uint32_t>(h - 'a' + 10);
+            else if (h >= 'A' && h <= 'F') cp |= static_cast<uint32_t>(h - 'A' + 10);
+            else throw std::runtime_error("Invalid hex in unicode escape");
+        }
+        return cp;
+    }
+
+    static void append_utf8(std::string& out, uint32_t cp) {
+        if (cp <= 0x7Fu) {
+            out.push_back(static_cast<char>(cp));
+        } else if (cp <= 0x7FFu) {
+            out.push_back(static_cast<char>(0xC0u | (cp >> 6)));
+            out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+        } else if (cp <= 0xFFFFu) {
+            if (cp >= 0xD800u && cp <= 0xDFFFu) {
+                throw std::runtime_error("Invalid surrogate code point");
+            }
+            out.push_back(static_cast<char>(0xE0u | (cp >> 12)));
+            out.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+            out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+        } else if (cp <= 0x10FFFFu) {
+            out.push_back(static_cast<char>(0xF0u | (cp >> 18)));
+            out.push_back(static_cast<char>(0x80u | ((cp >> 12) & 0x3Fu)));
+            out.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+            out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+        } else {
+            throw std::runtime_error("Unicode code point out of range");
+        }
+    }
+
     std::string parse_string() {
         if (get() != '"') throw std::runtime_error("Expected '\"'");
         std::string out;
         while (pos_ < s_.size()) {
-            char c = get();
-            if (c == '"') return out;
-            if (static_cast<unsigned char>(c) < 0x20) {
+            unsigned char uc = static_cast<unsigned char>(get());
+            if (uc == '"') return out;
+            if (uc < 0x20u) {
                 throw std::runtime_error("Unescaped control character in JSON string");
             }
-            if (c == '\\') {
+            if (uc == '\\') {
                 char esc = get();
                 switch (esc) {
                     case '"': out.push_back('"'); break;
@@ -98,24 +135,59 @@ private:
                     case 'r': out.push_back('\r'); break;
                     case 't': out.push_back('\t'); break;
                     case 'u': {
-                        if (pos_ + 4 > s_.size()) throw std::runtime_error("Invalid unicode escape");
-                        unsigned int cp = 0;
-                        for (int i = 0; i < 4; ++i) {
-                            char h = get();
-                            cp <<= 4;
-                            if (h >= '0' && h <= '9') cp |= static_cast<unsigned int>(h - '0');
-                            else if (h >= 'a' && h <= 'f') cp |= static_cast<unsigned int>(h - 'a' + 10);
-                            else if (h >= 'A' && h <= 'F') cp |= static_cast<unsigned int>(h - 'A' + 10);
-                            else throw std::runtime_error("Invalid hex in unicode escape");
+                        uint32_t u1 = parse_hex4(s_, pos_);
+                        if (u1 >= 0xDC00u && u1 <= 0xDFFFu) {
+                            throw std::runtime_error("Lone low surrogate in JSON string");
                         }
-                        if (cp < 0x80) out.push_back(static_cast<char>(cp));
-                        else out.push_back('?');
+                        if (u1 >= 0xD800u && u1 <= 0xDBFFu) {
+                            if (pos_ + 2 > s_.size() || s_[pos_] != '\\' || s_[pos_ + 1] != 'u') {
+                                throw std::runtime_error("Unpaired high surrogate in JSON string");
+                            }
+                            pos_ += 2;
+                            uint32_t u2 = parse_hex4(s_, pos_);
+                            if (u2 < 0xDC00u || u2 > 0xDFFFu) {
+                                throw std::runtime_error("Invalid low surrogate in JSON string");
+                            }
+                            uint32_t cp = 0x10000u + (((u1 - 0xD800u) << 10) | (u2 - 0xDC00u));
+                            append_utf8(out, cp);
+                        } else {
+                            append_utf8(out, u1);
+                        }
                         break;
                     }
                     default: throw std::runtime_error("Invalid JSON escape");
                 }
+            } else if (uc < 0x80u) {
+                out.push_back(static_cast<char>(uc));
             } else {
-                out.push_back(c);
+                // Validate raw UTF-8 multibyte sequence strictly
+                size_t len = 0;
+                uint32_t cp = 0;
+                uint32_t min_cp = 0;
+                if ((uc & 0xE0u) == 0xC0u) {
+                    len = 2; cp = uc & 0x1Fu; min_cp = 0x80u;
+                } else if ((uc & 0xF0u) == 0xE0u) {
+                    len = 3; cp = uc & 0x0Fu; min_cp = 0x800u;
+                } else if ((uc & 0xF8u) == 0xF0u) {
+                    len = 4; cp = uc & 0x07u; min_cp = 0x10000u;
+                } else {
+                    throw std::runtime_error("Invalid UTF-8 lead byte in JSON string");
+                }
+                if (pos_ + (len - 1) > s_.size()) {
+                    throw std::runtime_error("Truncated UTF-8 sequence in JSON string");
+                }
+                out.push_back(static_cast<char>(uc));
+                for (size_t i = 1; i < len; ++i) {
+                    unsigned char cont = static_cast<unsigned char>(s_[pos_++]);
+                    if ((cont & 0xC0u) != 0x80u) {
+                        throw std::runtime_error("Invalid UTF-8 continuation byte in JSON string");
+                    }
+                    cp = (cp << 6) | (cont & 0x3Fu);
+                    out.push_back(static_cast<char>(cont));
+                }
+                if (cp < min_cp || cp > 0x10FFFFu || (cp >= 0xD800u && cp <= 0xDFFFu)) {
+                    throw std::runtime_error("Invalid or overlong UTF-8 code point in JSON string");
+                }
             }
         }
         throw std::runtime_error("Unterminated JSON string");
@@ -225,6 +297,22 @@ JsonValue parse_json_strict(const std::string& input, size_t max_bytes, int max_
     }
     Parser p(input, max_depth);
     return p.parse();
+}
+
+bool has_embedded_nul(const std::string& s) {
+    return s.find('\0') != std::string::npos;
+}
+
+bool is_valid_identifier(const std::string& s, size_t max_len) {
+    if (s.empty() || s.size() > max_len || has_embedded_nul(s)) return false;
+    for (unsigned char c : s) {
+        bool ok = (c >= 'a' && c <= 'z') ||
+                  (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') ||
+                  c == '.' || c == '_' || c == '-' || c == ':';
+        if (!ok) return false;
+    }
+    return true;
 }
 
 }  // namespace aq

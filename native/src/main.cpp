@@ -17,7 +17,7 @@ void on_sig(int) { g_stop_serve.store(true); }
 int main(int argc, char** argv) {
     try {
         if (argc < 2) {
-            std::cerr << "Usage: aegis_native <fixture|train|infer|replay> ...\n";
+            std::cerr << "Usage: aegis_native <fixture|train|infer|replay|shadow|serve|backup|rollback> ...\n";
             return 2;
         }
         std::string cmd = argv[1];
@@ -99,6 +99,24 @@ int main(int argc, char** argv) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
             srv.stop();
+            return 0;
+        }
+        if (cmd == "backup") {
+            if (argc < 5) return 2;
+            aq::NativeOms oms(argv[2]);
+            auto mf = oms.create_backup_manifest(argv[3], argv[4]);
+            std::cout << "{\"command\":\"backup\",\"schema_version\":" << mf.schema_version
+                      << ",\"code_sha\":\"" << mf.code_sha
+                      << "\",\"model_format\":\"" << mf.model_format
+                      << "\",\"backup_hash\":\"" << mf.backup_hash
+                      << "\",\"manifest_path\":\"" << mf.manifest_path << "\"}\n";
+            return 0;
+        }
+        if (cmd == "rollback") {
+            if (argc < 4) return 2;
+            aq::NativeOms::restore_from_backup_manifest(argv[2], argv[3]);
+            std::cout << "{\"command\":\"rollback\",\"manifest_path\":\"" << argv[2]
+                      << "\",\"target_db\":\"" << argv[3] << "\",\"restored\":true}\n";
             return 0;
         }
         return 2;

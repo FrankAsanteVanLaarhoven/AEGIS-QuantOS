@@ -640,9 +640,12 @@ HttpResponse NativeHttpServer::handle_request(const HttpRequest& req) {
                 return it->second.as_string();
             };
             std::string cid = req_str("client_order_id");
+            if (!is_valid_identifier(cid, 128)) {
+                return {400, "application/json", {}, "{\"detail\":\"Invalid client_order_id characters or length\"}"};
+            }
             std::string sym = req_str("symbol");
-            if (sym.size() >= AQ_MAX_SYMBOL_LEN) {
-                return {400, "application/json", {}, "{\"detail\":\"Symbol exceeds AQ_MAX_SYMBOL_LEN\"}"};
+            if (!is_valid_identifier(sym, AQ_MAX_SYMBOL_LEN - 1)) {
+                return {400, "application/json", {}, "{\"detail\":\"Invalid symbol characters or exceeds AQ_MAX_SYMBOL_LEN\"}"};
             }
             std::string side_s = req_str("side");
             uint8_t side_u = 0;
@@ -668,7 +671,9 @@ HttpResponse NativeHttpServer::handle_request(const HttpRequest& req) {
             std::string account_id = "default";
             if (auto it = obj.find("account_id"); it != obj.end()) {
                 account_id = it->second.as_string();
-                if (account_id.empty()) return {400, "application/json", {}, "{\"detail\":\"Empty account_id\"}"};
+                if (!is_valid_identifier(account_id, 128)) {
+                    return {400, "application/json", {}, "{\"detail\":\"Invalid account_id characters or length\"}"};
+                }
             }
 
             auto it_qty = obj.find("qty");

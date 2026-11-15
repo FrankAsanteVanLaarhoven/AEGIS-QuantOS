@@ -42,5 +42,9 @@ struct JsonValue {
 // Strict bounded RFC 8259 parser: rejects duplicate keys, trailing tokens, and excessive depth/size.
 JsonValue parse_json_strict(const std::string& input, size_t max_bytes = 1048576, int max_depth = 32);
 
+// Explicit identifier validation: [A-Za-z0-9._:-], bounded length, no NUL/whitespace/control chars.
+bool is_valid_identifier(const std::string& s, size_t max_len = 128);
+bool has_embedded_nul(const std::string& s);
+
 }  // namespace aq
 

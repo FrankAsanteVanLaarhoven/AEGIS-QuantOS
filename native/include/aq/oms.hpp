@@ -66,6 +66,7 @@ struct OmsOrderRecord {
     std::string broker_order_id;
     uint32_t reason_mask = 0;
     std::string last_error;
+    bool legacy_unverified = false;
 };
 
 struct OmsSubmitResult {
@@ -177,6 +178,31 @@ public:
     std::vector<OmsOrderRecord> recover_in_flight(const std::string& env) const;
 
     static std::string hash_policy(const aq_risk_policy_t& policy);
+
+    static constexpr int kCurrentSchemaVersion = 2;
+    struct SchemaMeta {
+        int schema_version = 0;
+        std::string code_sha;
+        std::string model_format;
+        std::string backup_hash;
+        std::string updated_at;
+    };
+    struct BackupManifest {
+        std::string backup_db_path;
+        std::string manifest_path;
+        std::string code_sha;
+        int schema_version = 0;
+        std::string model_format;
+        std::string backup_hash;
+    };
+    SchemaMeta schema_meta() const;
+    BackupManifest create_backup_manifest(
+        const std::string& out_dir,
+        const std::string& code_sha,
+        const std::string& model_format = "aq_ckpt_v1") const;
+    static void restore_from_backup_manifest(
+        const std::string& manifest_path,
+        const std::string& target_db_path);
 
 private:
     struct Impl;

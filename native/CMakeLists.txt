@@ -56,3 +56,8 @@ target_link_libraries(test_native PRIVATE aq_engine)
 target_compile_options(test_native PRIVATE ${AQ_COMMON_FLAGS})
 add_test(NAME native_45_checks COMMAND test_native)
 
+add_executable(test_n3_gates tests/test_n3_gates.cpp)
+target_link_libraries(test_n3_gates PRIVATE aq_engine)
+target_compile_options(test_n3_gates PRIVATE ${AQ_COMMON_FLAGS})
+add_test(NAME n3_acceptance_gates COMMAND test_n3_gates)
+
